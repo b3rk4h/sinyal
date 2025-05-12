@@ -21,12 +21,13 @@ TP_LEVELS = [1.03, 1.06, 1.10]
 SL_PCT = 0.975
 TRAILING_SL_PCTS = [0.99, 1.00, 1.03]
 EXIT_PROFIT_PCT = 1.015
+RISK_PCT_PER_TRADE = 0.01  # Risiko 1% per trade
 
 open_positions = {}
 daily_signals = []
 performance_log = []
 last_report_date = None
-
+account_balance = 10  # Saldo akun untuk contoh, sesuaikan dengan nilai nyata
 
 def send_telegram(message):
     url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
@@ -36,22 +37,18 @@ def send_telegram(message):
     except Exception as e:
         print("Telegram error:", e)
 
-
 def get_candles(symbol, interval='30m', limit=50):
     url = f'{BINANCE_API}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
     r = requests.get(url)
     return r.json()
 
-
 def calculate_ma(data, period):
     closes = [float(c[4]) for c in data]
     return sum(closes[-period:]) / period
 
-
 def calculate_volume_ma(data, period):
     volumes = [float(c[5]) for c in data]
     return sum(volumes[-period:]) / period
-
 
 def get_price(symbol):
     try:
@@ -60,6 +57,31 @@ def get_price(symbol):
     except:
         return None
 
+def calculate_position_size(entry_price, stop_loss_price):
+    """Menghitung ukuran posisi berdasarkan saldo dan risiko"""
+    risk_amount = account_balance * RISK_PCT_PER_TRADE
+    position_size = risk_amount / (entry_price - stop_loss_price)
+    return position_size
+
+def adjust_stop_loss(symbol, entry_price, current_price, trailing_stop_pct=0.02):
+    """Mengatur trailing stop loss berdasarkan harga saat ini dan persentase"""
+    stop_loss = entry_price * (1 - trailing_stop_pct)
+    if current_price > stop_loss:
+        stop_loss = current_price * (1 - trailing_stop_pct)
+    return stop_loss
+
+def take_profit(symbol, entry_price, current_price, tp_pct=0.05):
+    """Mengambil keuntungan jika harga mencapai target tertentu"""
+    tp_price = entry_price * (1 + tp_pct)
+    if current_price >= tp_price:
+        send_telegram(f"✅ Take Profit tercapai untuk {symbol}: ${current_price:.2f}")
+        close_position(symbol)
+
+def close_position(symbol):
+    """Menutup posisi"""
+    if symbol in open_positions:
+        del open_positions[symbol]
+        send_telegram(f"Posisi {symbol} telah ditutup")
 
 def detect_signal(symbol):
     try:
@@ -78,16 +100,18 @@ def detect_signal(symbol):
         volume_ma10 = calculate_volume_ma(data_30m, 10)
 
         bullish_candle = close_30m > open_30m and (close_30m - open_30m) / open_30m > 0.002
-        volume_ok = volume_now > volume_ma10 * 1.05  # Optimasi: volume harus 5% di atas rata-rata
+        volume_ok = volume_now > volume_ma10 * 1.05  # Volume harus 5% lebih besar dari rata-rata
 
         if ma5_30m > ma20_30m and close_30m > ma5_30m and ma5_1h > ma20_1h and bullish_candle and volume_ok:
             if symbol not in open_positions:
+                position_size = calculate_position_size(close_30m, close_30m * SL_PCT)
                 open_positions[symbol] = {
                     'entry': close_30m,
                     'tps_hit': [],
                     'last_price': close_30m,
                     'sl_level': SL_PCT,
-                    'time': datetime.now()
+                    'time': datetime.now(),
+                    'position_size': position_size
                 }
                 daily_signals.append(symbol)
                 tp1 = close_30m * TP_LEVELS[0]
@@ -108,7 +132,6 @@ def detect_signal(symbol):
     except Exception as e:
         print(f"[ERROR] {symbol}: {e}")
 
-
 def check_tp_sl():
     for symbol, pos in list(open_positions.items()):
         price = get_price(symbol)
@@ -117,15 +140,15 @@ def check_tp_sl():
         entry = pos['entry']
         pos['last_price'] = price
 
-        if len(pos['tps_hit']) < len(TRAILING_SL_PCTS):
-            pos['sl_level'] = TRAILING_SL_PCTS[len(pos['tps_hit'])]
-
-        if price <= entry * pos['sl_level']:
+        # Update trailing stop loss jika harga bergerak
+        stop_loss = adjust_stop_loss(symbol, entry, price)
+        if price <= stop_loss:
             send_telegram(f"❌ STOP LOSS HIT: {symbol}\nEntry: ${entry:.4f} → SL: ${price:.4f}\nLoss: {((price-entry)/entry)*100:.2f}%")
             performance_log.append(((price-entry)/entry)*100)
             del open_positions[symbol]
             continue
 
+        # Mengecek TP berdasarkan harga saat ini
         for i, level in enumerate(TP_LEVELS):
             if i in pos['tps_hit']:
                 continue
@@ -137,9 +160,12 @@ def check_tp_sl():
                     performance_log.append(((target_price-entry)/entry)*100)
                     del open_positions[symbol]
 
-        if 0 in pos['tps_hit'] and price < entry * 1.01 and price > entry * 1.005:
-            send_telegram(f"⚠️ EXIT MANUAL DISARANKAN: {symbol}\nEntry: ${entry:.4f} → Now: ${price:.4f}\nMasih cuan tipis, hindari SL ulang.")
-
+        # Menutup posisi jika trend berbalik arah berdasarkan MA crossover
+        ma5_30m = calculate_ma(get_candles(symbol, '30m'), 5)
+        ma20_30m = calculate_ma(get_candles(symbol, '30m'), 20)
+        if ma5_30m < ma20_30m:
+            send_telegram(f"🚨 SELL SIGNAL: {symbol} - MA Crossover Detected. Exit position.")
+            close_position(symbol)
 
 print("🚀 Bot sinyal siap jalan...")
 while True:
