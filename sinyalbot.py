@@ -25,6 +25,8 @@ EXIT_PROFIT_PCT = 1.015
 open_positions = {}
 daily_signals = []
 performance_log = []
+last_report_date = None
+
 
 def send_telegram(message):
     url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
@@ -34,18 +36,22 @@ def send_telegram(message):
     except Exception as e:
         print("Telegram error:", e)
 
+
 def get_candles(symbol, interval='30m', limit=50):
     url = f'{BINANCE_API}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
     r = requests.get(url)
     return r.json()
 
+
 def calculate_ma(data, period):
     closes = [float(c[4]) for c in data]
     return sum(closes[-period:]) / period
 
+
 def calculate_volume_ma(data, period):
     volumes = [float(c[5]) for c in data]
     return sum(volumes[-period:]) / period
+
 
 def get_price(symbol):
     try:
@@ -53,6 +59,7 @@ def get_price(symbol):
         return float(r.json()['price'])
     except:
         return None
+
 
 def detect_signal(symbol):
     try:
@@ -71,11 +78,17 @@ def detect_signal(symbol):
         volume_ma10 = calculate_volume_ma(data_30m, 10)
 
         bullish_candle = close_30m > open_30m and (close_30m - open_30m) / open_30m > 0.002
-        volume_ok = volume_now > volume_ma10
+        volume_ok = volume_now > volume_ma10 * 1.05  # Optimasi: volume harus 5% di atas rata-rata
 
         if ma5_30m > ma20_30m and close_30m > ma5_30m and ma5_1h > ma20_1h and bullish_candle and volume_ok:
             if symbol not in open_positions:
-                open_positions[symbol] = {'entry': close_30m, 'tps_hit': [], 'last_price': close_30m, 'sl_level': SL_PCT, 'time': datetime.now()}
+                open_positions[symbol] = {
+                    'entry': close_30m,
+                    'tps_hit': [],
+                    'last_price': close_30m,
+                    'sl_level': SL_PCT,
+                    'time': datetime.now()
+                }
                 daily_signals.append(symbol)
                 tp1 = close_30m * TP_LEVELS[0]
                 tp2 = close_30m * TP_LEVELS[1]
@@ -94,6 +107,7 @@ def detect_signal(symbol):
                 send_telegram(message)
     except Exception as e:
         print(f"[ERROR] {symbol}: {e}")
+
 
 def check_tp_sl():
     for symbol, pos in list(open_positions.items()):
@@ -126,9 +140,19 @@ def check_tp_sl():
         if 0 in pos['tps_hit'] and price < entry * 1.01 and price > entry * 1.005:
             send_telegram(f"⚠️ EXIT MANUAL DISARANKAN: {symbol}\nEntry: ${entry:.4f} → Now: ${price:.4f}\nMasih cuan tipis, hindari SL ulang.")
 
-def daily_report():
-    now = datetime.now()
-    if now.hour == 0 and now.minute == 0:
+
+print("🚀 Bot sinyal siap jalan...")
+while True:
+    now = datetime.utcnow() + timedelta(hours=7)  # WIB timezone
+
+    if now.minute % 30 == 0:
+        for sym in SYMBOLS:
+            detect_signal(sym)
+
+    check_tp_sl()
+
+    # Kirim laporan harian hanya 1x per hari pukul 00:00 WIB
+    if now.hour == 0 and now.minute == 0 and (last_report_date != now.date()):
         total = len(performance_log)
         win = len([x for x in performance_log if x > 0])
         loss = total - win
@@ -145,15 +169,8 @@ def daily_report():
             summary += "\n⚠️ Tidak ada sinyal valid hari ini."
 
         send_telegram(summary)
+        last_report_date = now.date()
         daily_signals.clear()
         performance_log.clear()
 
-print("🚀 Bot sinyal siap jalan...")
-while True:
-    now = datetime.utcnow() + timedelta(hours=7)  # WIB timezone
-    if now.minute % 30 == 0:
-        for sym in SYMBOLS:
-            detect_signal(sym)
-    check_tp_sl()
-    daily_report()
     time.sleep(60)
