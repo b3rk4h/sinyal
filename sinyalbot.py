@@ -37,10 +37,16 @@ def send_telegram(message):
     except Exception as e:
         print("Telegram error:", e)
 
-def get_candles(symbol, interval='30m', limit=50):
+def get_candles(symbol, interval='30m', limit=50, retries=3):
     url = f'{BINANCE_API}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
-    r = requests.get(url)
-    return r.json()
+    for _ in range(retries):
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            time.sleep(1)
+    return []
 
 def calculate_ma(data, period):
     closes = [float(c[4]) for c in data]
