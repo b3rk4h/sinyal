@@ -23,12 +23,13 @@ SYMBOLS = [
 
 TP_LEVELS = [1.03, 1.06, 1.10]
 SL_PCT = 0.975
-TRAILING_SL_PCTS = [0.99, 1.00, 1.03]
+TRAILING_SL_PCTS = [0.985, 0.99, 1.00]
 
 open_positions = {}
 daily_signals = []
 performance_log = []
 last_report_date = None
+MODE = "agresif"  # agresif atau defensif
 
 
 def send_telegram(message):
@@ -75,13 +76,13 @@ def get_usdt_balance():
         return 0
 
 
-def place_order(symbol, quantity):
+def place_order(symbol, qty, side):
     try:
         client.futures_create_order(
             symbol=symbol,
-            side=SIDE_BUY,
+            side=side,
             type=ORDER_TYPE_MARKET,
-            quantity=quantity
+            quantity=qty
         )
         return True
     except Exception as e:
@@ -91,7 +92,7 @@ def place_order(symbol, quantity):
 
 def detect_signal(symbol):
     try:
-        if open_positions:
+        if symbol in open_positions:
             return
 
         data_30m = get_candles(symbol, '30m')
@@ -99,53 +100,53 @@ def detect_signal(symbol):
 
         ma5_30m = calculate_ma(data_30m, 5)
         ma20_30m = calculate_ma(data_30m, 20)
-        close_30m = float(data_30m[-1][4])
-        open_30m = float(data_30m[-1][1])
-
         ma5_1h = calculate_ma(data_1h, 5)
         ma20_1h = calculate_ma(data_1h, 20)
 
+        close_30m = float(data_30m[-1][4])
+        open_30m = float(data_30m[-1][1])
         volume_now = float(data_30m[-1][5])
         volume_ma10 = calculate_volume_ma(data_30m, 10)
 
-        bullish_candle = close_30m > open_30m and (close_30m - open_30m) / open_30m > 0.002
-        volume_ok = volume_now > volume_ma10 * 1.05
+        candle_body_pct = abs(close_30m - open_30m) / open_30m
+        bullish = close_30m > open_30m and candle_body_pct > 0.002
+        bearish = close_30m < open_30m and candle_body_pct > 0.002
+        volume_ok = volume_now > volume_ma10 * (1.05 if MODE == "agresif" else 1.2)
 
-        if ma5_30m > ma20_30m and close_30m > ma5_30m and ma5_1h > ma20_1h and bullish_candle and volume_ok:
-            if symbol not in open_positions:
-                balance = get_usdt_balance()
-                if balance < 5:
-                    return
-                price = get_price(symbol)
-                if not price:
-                    return
-                qty = round(balance / price, 3)
-                if not place_order(symbol, qty):
-                    return
+        balance = get_usdt_balance()
+        price = get_price(symbol)
+        if not price or balance < 5:
+            return
+        qty = round(balance / price, 3)
 
+        if ma5_30m > ma20_30m and ma5_1h > ma20_1h and bullish and volume_ok:
+            if place_order(symbol, qty, SIDE_BUY):
                 open_positions[symbol] = {
                     'entry': price,
                     'tps_hit': [],
                     'last_price': price,
                     'sl_level': SL_PCT,
                     'qty': qty,
+                    'side': 'LONG',
                     'time': datetime.now()
                 }
                 daily_signals.append(symbol)
+                send_telegram(f"🔔 LONG BUY {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * x, 2) for x in TP_LEVELS]}\nSL: {price * SL_PCT:.2f}")
 
-                tp1 = price * TP_LEVELS[0]
-                tp2 = price * TP_LEVELS[1]
-                tp3 = price * TP_LEVELS[2]
-                sl = price * SL_PCT
+        elif ma5_30m < ma20_30m and ma5_1h < ma20_1h and bearish and volume_ok:
+            if place_order(symbol, qty, SIDE_SELL):
+                open_positions[symbol] = {
+                    'entry': price,
+                    'tps_hit': [],
+                    'last_price': price,
+                    'sl_level': 2 - SL_PCT,
+                    'qty': qty,
+                    'side': 'SHORT',
+                    'time': datetime.now()
+                }
+                daily_signals.append(symbol)
+                send_telegram(f"🔔 SHORT SELL {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * (2-x), 2) for x in TP_LEVELS]}\nSL: {price * (2 - SL_PCT):.2f}")
 
-                message = (
-                    f"🔔 BUY EXECUTED: {symbol}\n"
-                    f"Entry: ${price:.2f}\n"
-                    f"TP1: {tp1:.2f}, TP2: {tp2:.2f}, TP3: {tp3:.2f}\n"
-                    f"SL: {sl:.2f}\n"
-                    f"TF: 30m + 1H Confirm ✅"
-                )
-                send_telegram(message)
     except Exception as e:
         print(f"[ERROR] {symbol}: {e}")
 
@@ -157,70 +158,45 @@ def check_tp_sl():
             continue
 
         entry = pos['entry']
-        pos['last_price'] = price
         qty = pos['qty']
+        pos['last_price'] = price
 
         if len(pos['tps_hit']) < len(TRAILING_SL_PCTS):
-            pos['sl_level'] = TRAILING_SL_PCTS[len(pos['tps_hit'])]
+            pos['sl_level'] = TRAILING_SL_PCTS[len(pos['tps_hit'])] if pos['side'] == 'LONG' else 2 - TRAILING_SL_PCTS[len(pos['tps_hit'])]
 
-        # SL Check
-        if price <= entry * pos['sl_level']:
-            send_telegram(f"❌ STOP LOSS HIT: {symbol}\nEntry: ${entry:.4f} → SL: ${price:.4f}\nLoss: {((price-entry)/entry)*100:.2f}%")
-            performance_log.append(((price-entry)/entry)*100)
-            client.futures_create_order(
-                symbol=symbol,
-                side=SIDE_SELL,
-                type=ORDER_TYPE_MARKET,
-                quantity=qty,
-                reduceOnly=True
-            )
+        sl_hit = price <= entry * pos['sl_level'] if pos['side'] == 'LONG' else price >= entry * pos['sl_level']
+        if sl_hit:
+            send_telegram(f"❌ STOP LOSS HIT {symbol} ({pos['side']})\nEntry: ${entry:.2f}, Exit: ${price:.2f}\nLoss: {((price-entry)/entry)*100:.2f}%")
+            performance_log.append(((price-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
+            client.futures_create_order(symbol=symbol, side=SIDE_SELL if pos['side'] == 'LONG' else SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True)
             del open_positions[symbol]
             continue
 
-        # TP check
         for i, level in enumerate(TP_LEVELS):
-            if i in pos['tps_hit']:
-                continue
-            target_price = entry * level
-            if price >= target_price:
-                send_telegram(f"✅ TP{i+1} HIT: {symbol}\nEntry: ${entry:.4f} → Target: ${target_price:.4f}\nCuan: {((target_price-entry)/entry)*100:.2f}%")
+            target = entry * level if pos['side'] == 'LONG' else entry * (2 - level)
+            if i not in pos['tps_hit'] and ((price >= target and pos['side'] == 'LONG') or (price <= target and pos['side'] == 'SHORT')):
+                send_telegram(f"✅ TP{i+1} HIT {symbol} ({pos['side']})\nTarget: ${target:.2f}")
                 pos['tps_hit'].append(i)
                 if i == len(TP_LEVELS) - 1:
-                    performance_log.append(((target_price-entry)/entry)*100)
-                    client.futures_create_order(
-                        symbol=symbol,
-                        side=SIDE_SELL,
-                        type=ORDER_TYPE_MARKET,
-                        quantity=qty,
-                        reduceOnly=True
-                    )
+                    performance_log.append(((target-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
+                    client.futures_create_order(symbol=symbol, side=SIDE_SELL if pos['side'] == 'LONG' else SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True)
                     del open_positions[symbol]
 
-        # Manual early exit suggestion
-        if 0 in pos['tps_hit'] and price < entry * 1.01 and price > entry * 1.005:
-            send_telegram(f"⚠️ EXIT MANUAL DISARANKAN: {symbol}\nEntry: ${entry:.4f} → Now: ${price:.4f}\nMasih cuan tipis, hindari SL ulang.")
-
-        # 🔁 Auto-close on trend reversal
         try:
             data_30m = get_candles(symbol, '30m')
             ma5_now = calculate_ma(data_30m, 5)
             ma20_now = calculate_ma(data_30m, 20)
-            if ma5_now < ma20_now:
-                send_telegram(f"🔁 AUTO CLOSE: Trend reversal detected on {symbol}\nExit price: ${price:.4f}")
-                performance_log.append(((price - entry) / entry) * 100)
-                client.futures_create_order(
-                    symbol=symbol,
-                    side=SIDE_SELL,
-                    type=ORDER_TYPE_MARKET,
-                    quantity=qty,
-                    reduceOnly=True
-                )
+            trend_reversal = (ma5_now < ma20_now if pos['side'] == 'LONG' else ma5_now > ma20_now)
+            if trend_reversal:
+                send_telegram(f"🔁 AUTO CLOSE {symbol} ({pos['side']}) Trend reversal\nExit: ${price:.2f}")
+                performance_log.append(((price-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
+                client.futures_create_order(symbol=symbol, side=SIDE_SELL if pos['side'] == 'LONG' else SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True)
                 del open_positions[symbol]
         except Exception as e:
             print(f"Trend reversal check error: {e}")
 
 
-print("🚀 Bot sinyal & live trading siap jalan...")
+print("🚀 Bot sinyal (LONG & SHORT) dengan mode agresif/defensif siap jalan...")
 while True:
     now = datetime.utcnow() + timedelta(hours=7)
     if now.minute % 30 == 0:
