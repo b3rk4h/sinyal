@@ -99,36 +99,57 @@ def detect_signal(symbol):
         volume_now = float(data_30m[-1][5])
         volume_ma10 = calculate_volume_ma(data_30m, 10)
 
-        bullish_candle = close_30m > open_30m and (close_30m - open_30m) / open_30m > 0.002
-        volume_ok = volume_now > volume_ma10 * 1.05  # Volume harus 5% lebih besar dari rata-rata
+        bullish = close_30m > open_30m and (close_30m - open_30m) / open_30m > 0.002
+        bearish = close_30m < open_30m and (open_30m - close_30m) / open_30m > 0.002
+        volume_ok = volume_now > volume_ma10 * 1.05
 
-        if ma5_30m > ma20_30m and close_30m > ma5_30m and ma5_1h > ma20_1h and bullish_candle and volume_ok:
+        entry_price = close_30m
+        sl_price = entry_price * SL_PCT
+        position_size = calculate_position_size(entry_price, sl_price)
+
+        # LONG SIGNAL
+        if ma5_30m > ma20_30m and ma5_1h > ma20_1h and bullish and volume_ok:
             if symbol not in open_positions:
-                position_size = calculate_position_size(close_30m, close_30m * SL_PCT)
                 open_positions[symbol] = {
-                    'entry': close_30m,
+                    'entry': entry_price,
                     'tps_hit': [],
-                    'last_price': close_30m,
+                    'last_price': entry_price,
                     'sl_level': SL_PCT,
                     'time': datetime.now(),
-                    'position_size': position_size
+                    'position_size': position_size,
+                    'direction': 'long'
                 }
                 daily_signals.append(symbol)
-                tp1 = close_30m * TP_LEVELS[0]
-                tp2 = close_30m * TP_LEVELS[1]
-                tp3 = close_30m * TP_LEVELS[2]
-                sl = close_30m * SL_PCT
-
-                message = (
-                    f"🔔 BUY SIGNAL: {symbol}\n"
-                    f"Entry: ${close_30m:.2f}\n"
-                    f"TP1: {tp1:.2f} (+{(TP_LEVELS[0]-1)*100:.1f}%)\n"
-                    f"TP2: {tp2:.2f} (+{(TP_LEVELS[1]-1)*100:.1f}%)\n"
-                    f"TP3: {tp3:.2f} (+{(TP_LEVELS[2]-1)*100:.1f}%)\n"
-                    f"SL: {sl:.2f} ({((SL_PCT-1)*100):.1f}%)\n"
-                    f"TF: 30m + 1H Confirm ✅"
+                send_telegram(
+                    f"🟢 LONG SIGNAL: {symbol}\n"
+                    f"Entry: ${entry_price:.2f}\n"
+                    f"TP1: {entry_price * TP_LEVELS[0]:.2f}\n"
+                    f"TP2: {entry_price * TP_LEVELS[1]:.2f}\n"
+                    f"TP3: {entry_price * TP_LEVELS[2]:.2f}\n"
+                    f"SL: {sl_price:.2f}\nTF: 30m + 1H Confirm ✅"
                 )
-                send_telegram(message)
+
+        # SHORT SIGNAL
+        elif ma5_30m < ma20_30m and ma5_1h < ma20_1h and bearish and volume_ok:
+            if symbol not in open_positions:
+                open_positions[symbol] = {
+                    'entry': entry_price,
+                    'tps_hit': [],
+                    'last_price': entry_price,
+                    'sl_level': SL_PCT,
+                    'time': datetime.now(),
+                    'position_size': position_size,
+                    'direction': 'short'
+                }
+                daily_signals.append(symbol)
+                send_telegram(
+                    f"🔻 SHORT SIGNAL: {symbol}\n"
+                    f"Entry: ${entry_price:.2f}\n"
+                    f"TP1: {entry_price * (2 - TP_LEVELS[0]):.2f}\n"
+                    f"TP2: {entry_price * (2 - TP_LEVELS[1]):.2f}\n"
+                    f"TP3: {entry_price * (2 - TP_LEVELS[2]):.2f}\n"
+                    f"SL: {entry_price / SL_PCT:.2f}\nTF: 30m + 1H Confirm ✅"
+                )
     except Exception as e:
         print(f"[ERROR] {symbol}: {e}")
 
@@ -137,34 +158,57 @@ def check_tp_sl():
         price = get_price(symbol)
         if not price:
             continue
+
         entry = pos['entry']
         pos['last_price'] = price
+        direction = pos.get('direction', 'long')
+        sl_price = 0
 
-        # Update trailing stop loss jika harga bergerak
-        stop_loss = adjust_stop_loss(symbol, entry, price)
-        if price <= stop_loss:
-            send_telegram(f"❌ STOP LOSS HIT: {symbol}\nEntry: ${entry:.4f} → SL: ${price:.4f}\nLoss: {((price-entry)/entry)*100:.2f}%")
-            performance_log.append(((price-entry)/entry)*100)
-            del open_positions[symbol]
-            continue
-
-        # Mengecek TP berdasarkan harga saat ini
-        for i, level in enumerate(TP_LEVELS):
-            if i in pos['tps_hit']:
+        if direction == 'long':
+            # Hit SL?
+            sl_price = entry * SL_PCT
+            if price <= sl_price:
+                send_telegram(f"❌ SL HIT: {symbol} (LONG)\nEntry: ${entry:.2f} → SL: ${price:.2f}")
+                performance_log.append(((price-entry)/entry)*100)
+                del open_positions[symbol]
                 continue
-            target_price = entry * level
-            if price >= target_price:
-                send_telegram(f"✅ TP{i+1} HIT: {symbol}\nEntry: ${entry:.4f} → Target: ${target_price:.4f}\nCuan: {((target_price-entry)/entry)*100:.2f}%")
-                pos['tps_hit'].append(i)
-                if i == len(TP_LEVELS) - 1:
-                    performance_log.append(((target_price-entry)/entry)*100)
-                    del open_positions[symbol]
+            # TP check
+            for i, level in enumerate(TP_LEVELS):
+                if i in pos['tps_hit']:
+                    continue
+                target = entry * level
+                if price >= target:
+                    send_telegram(f"✅ TP{i+1} HIT: {symbol} (LONG)\nCuan: {(level-1)*100:.2f}%")
+                    pos['tps_hit'].append(i)
+                    if i == len(TP_LEVELS) - 1:
+                        performance_log.append(((price-entry)/entry)*100)
+                        del open_positions[symbol]
 
-        # Menutup posisi jika trend berbalik arah berdasarkan MA crossover
+        elif direction == 'short':
+            sl_price = entry / SL_PCT
+            if price >= sl_price:
+                send_telegram(f"❌ SL HIT: {symbol} (SHORT)\nEntry: ${entry:.2f} → SL: ${price:.2f}")
+                performance_log.append(((entry-price)/entry)*100)
+                del open_positions[symbol]
+                continue
+            # TP check (kebalikan)
+            for i, level in enumerate(TP_LEVELS):
+                if i in pos['tps_hit']:
+                    continue
+                target = entry * (2 - level)
+                if price <= target:
+                    send_telegram(f"✅ TP{i+1} HIT: {symbol} (SHORT)\nCuan: {(1 - (target/entry))*100:.2f}%")
+                    pos['tps_hit'].append(i)
+                    if i == len(TP_LEVELS) - 1:
+                        performance_log.append(((entry-price)/entry)*100)
+                        del open_positions[symbol]
+
+        # Exit kalau MA cross berbalik
         ma5_30m = calculate_ma(get_candles(symbol, '30m'), 5)
         ma20_30m = calculate_ma(get_candles(symbol, '30m'), 20)
-        if ma5_30m < ma20_30m:
-            send_telegram(f"🚨 SELL SIGNAL: {symbol} - MA Crossover Detected. Exit position.")
+
+        if (direction == 'long' and ma5_30m < ma20_30m) or (direction == 'short' and ma5_30m > ma20_30m):
+            send_telegram(f"🚨 TREND REVERSE: {symbol} ({direction.upper()})\nExit posisi karena MA cross.")
             close_position(symbol)
 
 print("🚀 Bot sinyal siap jalan...")
