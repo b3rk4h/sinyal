@@ -1,8 +1,7 @@
 import os
 import requests
 import time
-import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -65,6 +64,26 @@ def detect_breakout(data):
             return 'breakdown'
     return None
 
+# -------------- TP/SL Strategy by Symbol --------------
+def get_tp_sl(symbol, entry_price, direction):
+    if symbol in ['BTCUSDT', 'ETHUSDT']:
+        sl_pct, tp1_pct, tp2_pct = 0.01, 0.015, 0.03
+    elif symbol in ['SOLUSDT', 'OPUSDT']:
+        sl_pct, tp1_pct, tp2_pct = 0.015, 0.02, 0.04
+    else:
+        sl_pct, tp1_pct, tp2_pct = 0.02, 0.03, 0.05
+
+    if direction == 'BUY':
+        sl = entry_price * (1 - sl_pct)
+        tp1 = entry_price * (1 + tp1_pct)
+        tp2 = entry_price * (1 + tp2_pct)
+    else:
+        sl = entry_price * (1 + sl_pct)
+        tp1 = entry_price * (1 - tp1_pct)
+        tp2 = entry_price * (1 - tp2_pct)
+
+    return sl, tp1, tp2
+
 # -------------- Signal Detection Core --------------
 def detect_signal(symbol):
     try:
@@ -87,9 +106,7 @@ def detect_signal(symbol):
             if POSITION_STATE[symbol] == 'SELL':
                 send_telegram(f"❗️ SUGGEST EXIT: {symbol}\nPosisi sebelumnya: SELL\nSinyal berlawanan: BUY")
             POSITION_STATE[symbol] = 'BUY'
-            sl = price * 0.985
-            tp1 = price * 1.02
-            tp2 = price * 1.04
+            sl, tp1, tp2 = get_tp_sl(symbol, price, 'BUY')
             return f"🔔 BUY SIGNAL: {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
 
         elif ma5_5m < ma20_5m and ma5_15m < ma20_15m and price < ma5_5m and breakout_signal == 'breakdown':
@@ -97,9 +114,7 @@ def detect_signal(symbol):
             if POSITION_STATE[symbol] == 'BUY':
                 send_telegram(f"❗️ SUGGEST EXIT: {symbol}\nPosisi sebelumnya: BUY\nSinyal berlawanan: SELL")
             POSITION_STATE[symbol] = 'SELL'
-            sl = price * 1.015
-            tp1 = price * 0.98
-            tp2 = price * 0.96
+            sl, tp1, tp2 = get_tp_sl(symbol, price, 'SELL')
             return f"🔻 SELL SIGNAL: {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
 
     except Exception as e:
@@ -107,7 +122,7 @@ def detect_signal(symbol):
     return None
 
 # -------------- Main Runner --------------
-print("[RUNNING] Smart Signal Bot with Confirmation & Protection")
+print("[RUNNING] Smart Signal Bot with Confirmation & Adaptive TP/SL")
 while True:
     for symbol in SYMBOLS:
         try:
