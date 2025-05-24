@@ -15,6 +15,8 @@ COOLDOWN = 300  # Waktu jeda antar sinyal per simbol (detik)
 
 POSITION_STATE = {symbol: None for symbol in SYMBOLS}
 LAST_SIGNAL_TIME = {symbol: 0 for symbol in SYMBOLS}
+SIGNAL_STRENGTH = {symbol: None for symbol in SYMBOLS}
+LAST_TP_NOTIFICATION = {symbol: 0 for symbol in SYMBOLS}
 
 # -------------- Telegram Sender --------------
 def send_telegram(message):
@@ -26,7 +28,7 @@ def send_telegram(message):
         print("Telegram error:", e)
 
 # -------------- Binance Data Fetcher --------------
-def get_candles(symbol, interval='5m', limit=50):
+def get_candles(symbol, interval='1m', limit=50):
     url = f'{BINANCE_API}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
     r = requests.get(url)
     r.raise_for_status()
@@ -34,10 +36,18 @@ def get_candles(symbol, interval='5m', limit=50):
 
 # -------------- Indicator Calculations --------------
 def calculate_ma(data, period):
-    if len(data) < period:
-        raise ValueError("Data tidak cukup untuk MA")
     closes = [float(c[4]) for c in data]
     return sum(closes[-period:]) / period
+
+def calculate_rsi(data, period=14):
+    closes = [float(c[4]) for c in data]
+    deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
+    gains = sum([delta for delta in deltas[-period:] if delta > 0]) / period
+    losses = abs(sum([delta for delta in deltas[-period:] if delta < 0]) / period)
+    if losses == 0:
+        return 100
+    rs = gains / losses
+    return 100 - (100 / (1 + rs))
 
 def is_marubozu(candle):
     open_price = float(candle[1])
@@ -91,38 +101,53 @@ def detect_signal(symbol):
         if now - LAST_SIGNAL_TIME[symbol] < COOLDOWN:
             return None
 
-        data_5m = get_candles(symbol, '5m')
-        data_15m = get_candles(symbol, '15m')
-        price = float(data_5m[-1][4])
-        ma5_5m = calculate_ma(data_5m, 5)
-        ma20_5m = calculate_ma(data_5m, 20)
-        ma5_15m = calculate_ma(data_15m, 5)
-        ma20_15m = calculate_ma(data_15m, 20)
+        data_1m = get_candles(symbol, '1m')
+        data_1h = get_candles(symbol, '1h', 50)
+        price = float(data_1m[-1][4])
 
-        breakout_signal = detect_breakout(data_5m)
+        ma5_1m = calculate_ma(data_1m, 5)
+        ma20_1m = calculate_ma(data_1m, 20)
+        ma5_1h = calculate_ma(data_1h, 5)
+        ma20_1h = calculate_ma(data_1h, 20)
+        rsi = calculate_rsi(data_1m)
 
-        if ma5_5m > ma20_5m and ma5_15m > ma20_15m and price > ma5_5m and breakout_signal == 'breakout':
+        breakout_signal = detect_breakout(data_1m)
+
+        signal_strength = 'normal'
+        last_volume = float(data_1m[-1][5])
+        avg_volume = sum(float(c[5]) for c in data_1m[-6:-1]) / 5
+        if last_volume > 2 * avg_volume:
+            signal_strength = 'strong'
+
+        if ma5_1m > ma20_1m and ma5_1h > ma20_1h and price > ma5_1m and breakout_signal == 'breakout' and rsi < 70:
             LAST_SIGNAL_TIME[symbol] = now
             if POSITION_STATE[symbol] == 'SELL':
-                send_telegram(f"❗️ SUGGEST EXIT: {symbol}\nPosisi sebelumnya: SELL\nSinyal berlawanan: BUY")
+                send_telegram(f"🔁 REVERSAL: {symbol}\nSinyal berubah dari SELL ➜ BUY")
             POSITION_STATE[symbol] = 'BUY'
+            SIGNAL_STRENGTH[symbol] = signal_strength
             sl, tp1, tp2 = get_tp_sl(symbol, price, 'BUY')
-            return f"🔔 BUY SIGNAL: {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
+            return f"📈 BUY SIGNAL ({signal_strength.upper()}): {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
 
-        elif ma5_5m < ma20_5m and ma5_15m < ma20_15m and price < ma5_5m and breakout_signal == 'breakdown':
+        elif ma5_1m < ma20_1m and ma5_1h < ma20_1h and price < ma5_1m and breakout_signal == 'breakdown' and rsi > 30:
             LAST_SIGNAL_TIME[symbol] = now
             if POSITION_STATE[symbol] == 'BUY':
-                send_telegram(f"❗️ SUGGEST EXIT: {symbol}\nPosisi sebelumnya: BUY\nSinyal berlawanan: SELL")
+                send_telegram(f"🔁 REVERSAL: {symbol}\nSinyal berubah dari BUY ➜ SELL")
             POSITION_STATE[symbol] = 'SELL'
+            SIGNAL_STRENGTH[symbol] = signal_strength
             sl, tp1, tp2 = get_tp_sl(symbol, price, 'SELL')
-            return f"🔻 SELL SIGNAL: {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
+            return f"📉 SELL SIGNAL ({signal_strength.upper()}): {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
+
+        # Notifikasi jika sinyal kuat masih aktif
+        if SIGNAL_STRENGTH[symbol] == 'strong' and now - LAST_SIGNAL_TIME[symbol] > 1800:
+            send_telegram(f"📌 {symbol} sinyal KUAT masih berlaku. Tetap pertahankan posisi: {POSITION_STATE[symbol]}")
+            LAST_SIGNAL_TIME[symbol] = now
 
     except Exception as e:
         print(f"Error on {symbol}: {e}")
     return None
 
 # -------------- Main Runner --------------
-print("[RUNNING] Smart Signal Bot with Confirmation & Adaptive TP/SL")
+print("[RUNNING] Smart Signal Bot with RSI, Breakout, MA, and Strong Signal Alerts")
 while True:
     for symbol in SYMBOLS:
         try:
