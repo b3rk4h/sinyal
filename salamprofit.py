@@ -1,20 +1,13 @@
 import os
 import requests
 import time
-import logging
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from binance.client import Client
-from binance.enums import *
 
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-BINANCE_API_KEY = os.getenv('BINANCE_API_KEY')
-BINANCE_API_SECRET = os.getenv('BINANCE_API_SECRET')
-
-client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
 
 SYMBOLS = [
     'SOLUSDT', 'OPUSDT', 'DOGEUSDT', 'SUIUSDT', 'WIFUSDT', 'ETHUSDT',
@@ -65,31 +58,6 @@ def get_price(symbol):
         return None
 
 
-def get_usdt_balance():
-    try:
-        balance = client.futures_account_balance()
-        for b in balance:
-            if b['asset'] == 'USDT':
-                return float(b['balance'])
-        return 0
-    except:
-        return 0
-
-
-def place_order(symbol, qty, side):
-    try:
-        client.futures_create_order(
-            symbol=symbol,
-            side=side,
-            type=ORDER_TYPE_MARKET,
-            quantity=qty
-        )
-        return True
-    except Exception as e:
-        print("Order error:", e)
-        return False
-
-
 def detect_signal(symbol):
     try:
         if symbol in open_positions:
@@ -113,39 +81,37 @@ def detect_signal(symbol):
         bearish = close_30m < open_30m and candle_body_pct > 0.002
         volume_ok = volume_now > volume_ma10 * (1.05 if MODE == "agresif" else 1.2)
 
-        balance = get_usdt_balance()
         price = get_price(symbol)
-        if not price or balance < 5:
+        if not price:
             return
-        qty = round(balance / price, 3)
+
+        qty = 1  # dummy qty untuk simulasi
 
         if ma5_30m > ma20_30m and ma5_1h > ma20_1h and bullish and volume_ok:
-            if place_order(symbol, qty, SIDE_BUY):
-                open_positions[symbol] = {
-                    'entry': price,
-                    'tps_hit': [],
-                    'last_price': price,
-                    'sl_level': SL_PCT,
-                    'qty': qty,
-                    'side': 'LONG',
-                    'time': datetime.now()
-                }
-                daily_signals.append(symbol)
-                send_telegram(f"🔔 LONG BUY {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * x, 2) for x in TP_LEVELS]}\nSL: {price * SL_PCT:.2f}")
+            open_positions[symbol] = {
+                'entry': price,
+                'tps_hit': [],
+                'last_price': price,
+                'sl_level': SL_PCT,
+                'qty': qty,
+                'side': 'LONG',
+                'time': datetime.now()
+            }
+            daily_signals.append(symbol)
+            send_telegram(f"🔔 LONG BUY {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * x, 2) for x in TP_LEVELS]}\nSL: {price * SL_PCT:.2f}")
 
         elif ma5_30m < ma20_30m and ma5_1h < ma20_1h and bearish and volume_ok:
-            if place_order(symbol, qty, SIDE_SELL):
-                open_positions[symbol] = {
-                    'entry': price,
-                    'tps_hit': [],
-                    'last_price': price,
-                    'sl_level': 2 - SL_PCT,
-                    'qty': qty,
-                    'side': 'SHORT',
-                    'time': datetime.now()
-                }
-                daily_signals.append(symbol)
-                send_telegram(f"🔔 SHORT SELL {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * (2-x), 2) for x in TP_LEVELS]}\nSL: {price * (2 - SL_PCT):.2f}")
+            open_positions[symbol] = {
+                'entry': price,
+                'tps_hit': [],
+                'last_price': price,
+                'sl_level': 2 - SL_PCT,
+                'qty': qty,
+                'side': 'SHORT',
+                'time': datetime.now()
+            }
+            daily_signals.append(symbol)
+            send_telegram(f"🔔 SHORT SELL {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * (2-x), 2) for x in TP_LEVELS]}\nSL: {price * (2 - SL_PCT):.2f}")
 
     except Exception as e:
         print(f"[ERROR] {symbol}: {e}")
@@ -158,7 +124,6 @@ def check_tp_sl():
             continue
 
         entry = pos['entry']
-        qty = pos['qty']
         pos['last_price'] = price
 
         if len(pos['tps_hit']) < len(TRAILING_SL_PCTS):
@@ -168,7 +133,6 @@ def check_tp_sl():
         if sl_hit:
             send_telegram(f"❌ STOP LOSS HIT {symbol} ({pos['side']})\nEntry: ${entry:.2f}, Exit: ${price:.2f}\nLoss: {((price-entry)/entry)*100:.2f}%")
             performance_log.append(((price-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
-            client.futures_create_order(symbol=symbol, side=SIDE_SELL if pos['side'] == 'LONG' else SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True)
             del open_positions[symbol]
             continue
 
@@ -179,7 +143,6 @@ def check_tp_sl():
                 pos['tps_hit'].append(i)
                 if i == len(TP_LEVELS) - 1:
                     performance_log.append(((target-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
-                    client.futures_create_order(symbol=symbol, side=SIDE_SELL if pos['side'] == 'LONG' else SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True)
                     del open_positions[symbol]
 
         try:
@@ -190,7 +153,6 @@ def check_tp_sl():
             if trend_reversal:
                 send_telegram(f"🔁 AUTO CLOSE {symbol} ({pos['side']}) Trend reversal\nExit: ${price:.2f}")
                 performance_log.append(((price-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
-                client.futures_create_order(symbol=symbol, side=SIDE_SELL if pos['side'] == 'LONG' else SIDE_BUY, type=ORDER_TYPE_MARKET, quantity=qty, reduceOnly=True)
                 del open_positions[symbol]
         except Exception as e:
             print(f"Trend reversal check error: {e}")
