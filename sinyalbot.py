@@ -74,7 +74,7 @@ def detect_breakout(data):
             return 'breakdown'
     return None
 
-# -------------- TP/SL Strategy by Symbol --------------
+# -------------- TP/SL Strategy --------------
 def get_tp_sl(symbol, entry_price, direction):
     if symbol in ['BTCUSDT', 'ETHUSDT']:
         sl_pct, tp1_pct, tp2_pct = 0.01, 0.015, 0.03
@@ -101,25 +101,25 @@ def detect_signal(symbol):
         if now - LAST_SIGNAL_TIME[symbol] < COOLDOWN:
             return None
 
-        data_1m = get_candles(symbol, '1m')
-        data_1h = get_candles(symbol, '1h', 50)
-        price = float(data_1m[-1][4])
+        data_15m = get_candles(symbol, '15m', 50)
+        data_4h = get_candles(symbol, '4h', 50)
+        price = float(data_15m[-1][4])
 
-        ma5_1m = calculate_ma(data_1m, 5)
-        ma20_1m = calculate_ma(data_1m, 20)
-        ma5_1h = calculate_ma(data_1h, 5)
-        ma20_1h = calculate_ma(data_1h, 20)
-        rsi = calculate_rsi(data_1m)
+        ma5_15m = calculate_ma(data_15m, 5)
+        ma20_15m = calculate_ma(data_15m, 20)
+        ma5_4h = calculate_ma(data_4h, 5)
+        ma20_4h = calculate_ma(data_4h, 20)
+        rsi = calculate_rsi(data_15m)
 
-        breakout_signal = detect_breakout(data_1m)
+        breakout_signal = detect_breakout(data_15m)
 
         signal_strength = 'normal'
-        last_volume = float(data_1m[-1][5])
-        avg_volume = sum(float(c[5]) for c in data_1m[-6:-1]) / 5
+        last_volume = float(data_15m[-1][5])
+        avg_volume = sum(float(c[5]) for c in data_15m[-6:-1]) / 5
         if last_volume > 2 * avg_volume:
             signal_strength = 'strong'
 
-        if ma5_1m > ma20_1m and ma5_1h > ma20_1h and price > ma5_1m and breakout_signal == 'breakout' and rsi < 70:
+        if ma5_15m > ma20_15m and ma5_4h > ma20_4h and price > ma5_15m and breakout_signal == 'breakout' and rsi < 70:
             LAST_SIGNAL_TIME[symbol] = now
             if POSITION_STATE[symbol] == 'SELL':
                 send_telegram(f"🔁 REVERSAL: {symbol}\nSinyal berubah dari SELL ➜ BUY")
@@ -128,7 +128,7 @@ def detect_signal(symbol):
             sl, tp1, tp2 = get_tp_sl(symbol, price, 'BUY')
             return f"📈 BUY SIGNAL ({signal_strength.upper()}): {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
 
-        elif ma5_1m < ma20_1m and ma5_1h < ma20_1h and price < ma5_1m and breakout_signal == 'breakdown' and rsi > 30:
+        elif ma5_15m < ma20_15m and ma5_4h < ma20_4h and price < ma5_15m and breakout_signal == 'breakdown' and rsi > 30:
             LAST_SIGNAL_TIME[symbol] = now
             if POSITION_STATE[symbol] == 'BUY':
                 send_telegram(f"🔁 REVERSAL: {symbol}\nSinyal berubah dari BUY ➜ SELL")
@@ -137,7 +137,6 @@ def detect_signal(symbol):
             sl, tp1, tp2 = get_tp_sl(symbol, price, 'SELL')
             return f"📉 SELL SIGNAL ({signal_strength.upper()}): {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
 
-        # Notifikasi jika sinyal kuat masih aktif
         if SIGNAL_STRENGTH[symbol] == 'strong' and now - LAST_SIGNAL_TIME[symbol] > 1800:
             send_telegram(f"📌 {symbol} sinyal KUAT masih berlaku. Tetap pertahankan posisi: {POSITION_STATE[symbol]}")
             LAST_SIGNAL_TIME[symbol] = now
@@ -147,7 +146,7 @@ def detect_signal(symbol):
     return None
 
 # -------------- Main Runner --------------
-print("[RUNNING] Smart Signal Bot with RSI, Breakout, MA, and Strong Signal Alerts")
+print("[RUNNING] Smart Signal Bot (15m vs 4h) with RSI, Breakout, MA, and Strong Signal Alerts")
 while True:
     for symbol in SYMBOLS:
         try:
