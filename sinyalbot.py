@@ -1,158 +1,128 @@
-import os
-import requests
+import ccxt
+import pandas as pd
+import ta
 import time
+import requests
 from datetime import datetime
-from dotenv import load_dotenv
 
-load_dotenv()
+# === Telegram Config ===
+TELEGRAM_TOKEN = '8074521734:AAHIJRTB9Md96h1b690T2iRRzytMwJACxkc'
+CHAT_ID = '1950841966'
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-BINANCE_API = 'https://api.binance.com'
-
-SYMBOLS = ['SOLUSDT', 'OPUSDT', 'DOGEUSDT', 'SUIUSDT', 'WIFUSDT', 'BTCUSDT', 'ETHUSDT']
-COOLDOWN = 300  # Waktu jeda antar sinyal per simbol (detik)
-
-POSITION_STATE = {symbol: None for symbol in SYMBOLS}
-LAST_SIGNAL_TIME = {symbol: 0 for symbol in SYMBOLS}
-SIGNAL_STRENGTH = {symbol: None for symbol in SYMBOLS}
-LAST_TP_NOTIFICATION = {symbol: 0 for symbol in SYMBOLS}
-
-# -------------- Telegram Sender --------------
-def send_telegram(message):
+def send_telegram(text):
     url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
+    data = {'chat_id': CHAT_ID, 'text': text}
     try:
-        requests.post(url, data=payload)
+        requests.post(url, data=data)
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"Telegram error: {e}")
 
-# -------------- Binance Data Fetcher --------------
-def get_candles(symbol, interval='1m', limit=50):
-    url = f'{BINANCE_API}/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}'
-    r = requests.get(url)
-    r.raise_for_status()
-    return r.json()
+# === Exchange & Market Config ===
+exchange = ccxt.binance({'enableRateLimit': True})
+symbols = ['SOL/USDT', 'OP/USDT', 'DOGE/USDT', 'PEPE/USDT', 'WIF/USDT']
+timeframe = '15m'
+limit = 120
+last_signal = {}
 
-# -------------- Indicator Calculations --------------
-def calculate_ma(data, period):
-    closes = [float(c[4]) for c in data]
-    return sum(closes[-period:]) / period
-
-def calculate_rsi(data, period=14):
-    closes = [float(c[4]) for c in data]
-    deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
-    gains = sum([delta for delta in deltas[-period:] if delta > 0]) / period
-    losses = abs(sum([delta for delta in deltas[-period:] if delta < 0]) / period)
-    if losses == 0:
-        return 100
-    rs = gains / losses
-    return 100 - (100 / (1 + rs))
-
-def is_marubozu(candle):
-    open_price = float(candle[1])
-    close_price = float(candle[4])
-    high = float(candle[2])
-    low = float(candle[3])
-    body = abs(close_price - open_price)
-    shadow = (high - low) - body
-    return shadow <= body * 0.3
-
-def detect_breakout(data):
-    last = data[-1]
-    prev = data[-2]
-    volume_now = float(last[5])
-    volume_prev = float(prev[5])
-    price = float(last[4])
-    resistance = max(float(c[2]) for c in data[-6:-1])
-    support = min(float(c[3]) for c in data[-6:-1])
-
-    if volume_now > 1.5 * volume_prev:
-        if price > resistance and is_marubozu(last):
-            return 'breakout'
-        elif price < support and is_marubozu(last):
-            return 'breakdown'
-    return None
-
-# -------------- TP/SL Strategy --------------
-def get_tp_sl(symbol, entry_price, direction):
-    if symbol in ['BTCUSDT', 'ETHUSDT']:
-        sl_pct, tp1_pct, tp2_pct = 0.01, 0.015, 0.03
-    elif symbol in ['SOLUSDT', 'OPUSDT']:
-        sl_pct, tp1_pct, tp2_pct = 0.015, 0.02, 0.04
+# === Hitung TP & SL ===
+def calculate_targets(price, signal, total_amount=20):
+    if signal == 'BUY':
+        tp1 = price * 1.015
+        tp2 = price * 1.03
+        tp3 = price * 1.05
+        sl = price * 0.98
+    elif signal == 'SELL':
+        tp1 = price * 0.985
+        tp2 = price * 0.97
+        tp3 = price * 0.95
+        sl = price * 1.02
     else:
-        sl_pct, tp1_pct, tp2_pct = 0.02, 0.03, 0.05
+        return None, None, None, None, None
 
-    if direction == 'BUY':
-        sl = entry_price * (1 - sl_pct)
-        tp1 = entry_price * (1 + tp1_pct)
-        tp2 = entry_price * (1 + tp2_pct)
-    else:
-        sl = entry_price * (1 + sl_pct)
-        tp1 = entry_price * (1 - tp1_pct)
-        tp2 = entry_price * (1 - tp2_pct)
+    tp1_amt = total_amount * 0.5
+    tp2_amt = total_amount * 0.3
+    tp3_amt = total_amount * 0.2
 
-    return sl, tp1, tp2
+    return (round(tp1, 4), round(tp2, 4), round(tp3, 4), round(sl, 4),
+            [tp1_amt, tp2_amt, tp3_amt])
 
-# -------------- Signal Detection Core --------------
-def detect_signal(symbol):
-    try:
-        now = time.time()
-        if now - LAST_SIGNAL_TIME[symbol] < COOLDOWN:
-            return None
+# === Analisa Sinyal ===
+def analyze(df):
+    df['ma5'] = df['close'].rolling(5).mean()
+    df['ma20'] = df['close'].rolling(20).mean()
+    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+    bb = ta.volatility.BollingerBands(df['close'], window=20)
+    df['bb_upper'] = bb.bollinger_hband()
+    df['bb_lower'] = bb.bollinger_lband()
+    df['volume_ma'] = df['volume'].rolling(10).mean()
 
-        data_15m = get_candles(symbol, '15m', 50)
-        data_4h = get_candles(symbol, '4h', 50)
-        price = float(data_15m[-1][4])
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
-        ma5_15m = calculate_ma(data_15m, 5)
-        ma20_15m = calculate_ma(data_15m, 20)
-        ma5_4h = calculate_ma(data_4h, 5)
-        ma20_4h = calculate_ma(data_4h, 20)
-        rsi = calculate_rsi(data_15m)
+    signal = None
+    reason = []
 
-        breakout_signal = detect_breakout(data_15m)
+    if (latest['ma5'] > latest['ma20'] and
+        latest['rsi'] < 70 and
+        latest['close'] > latest['ma5'] and
+        latest['close'] > prev['close'] and
+        latest['volume'] > 1.2 * latest['volume_ma']):
+        signal = 'BUY'
+        reason.append("MA5 > MA20")
+        reason.append("RSI OK")
+        reason.append("Break MA + Volume Spike")
+        reason.append("Konfirmasi Bullish")
 
-        signal_strength = 'normal'
-        last_volume = float(data_15m[-1][5])
-        avg_volume = sum(float(c[5]) for c in data_15m[-6:-1]) / 5
-        if last_volume > 2 * avg_volume:
-            signal_strength = 'strong'
+    elif (latest['ma5'] < latest['ma20'] and
+          latest['rsi'] > 30 and
+          latest['close'] < latest['ma5'] and
+          latest['close'] < prev['close'] and
+          latest['volume'] > 1.2 * latest['volume_ma']):
+        signal = 'SELL'
+        reason.append("MA5 < MA20")
+        reason.append("RSI OK")
+        reason.append("Breakdown + Volume Spike")
+        reason.append("Konfirmasi Bearish")
 
-        if ma5_15m > ma20_15m and ma5_4h > ma20_4h and price > ma5_15m and breakout_signal == 'breakout' and rsi < 70:
-            LAST_SIGNAL_TIME[symbol] = now
-            if POSITION_STATE[symbol] == 'SELL':
-                send_telegram(f"🔁 REVERSAL: {symbol}\nSinyal berubah dari SELL ➜ BUY")
-            POSITION_STATE[symbol] = 'BUY'
-            SIGNAL_STRENGTH[symbol] = signal_strength
-            sl, tp1, tp2 = get_tp_sl(symbol, price, 'BUY')
-            return f"📈 BUY SIGNAL ({signal_strength.upper()}): {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
+    return signal, reason
 
-        elif ma5_15m < ma20_15m and ma5_4h < ma20_4h and price < ma5_15m and breakout_signal == 'breakdown' and rsi > 30:
-            LAST_SIGNAL_TIME[symbol] = now
-            if POSITION_STATE[symbol] == 'BUY':
-                send_telegram(f"🔁 REVERSAL: {symbol}\nSinyal berubah dari BUY ➜ SELL")
-            POSITION_STATE[symbol] = 'SELL'
-            SIGNAL_STRENGTH[symbol] = signal_strength
-            sl, tp1, tp2 = get_tp_sl(symbol, price, 'SELL')
-            return f"📉 SELL SIGNAL ({signal_strength.upper()}): {symbol}\nEntry: {price:.4f}\nSL: {sl:.4f}\nTP1: {tp1:.4f}\nTP2: {tp2:.4f}"
-
-        if SIGNAL_STRENGTH[symbol] == 'strong' and now - LAST_SIGNAL_TIME[symbol] > 1800:
-            send_telegram(f"📌 {symbol} sinyal KUAT masih berlaku. Tetap pertahankan posisi: {POSITION_STATE[symbol]}")
-            LAST_SIGNAL_TIME[symbol] = now
-
-    except Exception as e:
-        print(f"Error on {symbol}: {e}")
-    return None
-
-# -------------- Main Runner --------------
-print("[RUNNING] Smart Signal Bot (15m vs 4h) with RSI, Breakout, MA, and Strong Signal Alerts")
+# === Main Bot ===
+print("\n✅ Bot sinyal trading dimulai...")
 while True:
-    for symbol in SYMBOLS:
-        try:
-            signal = detect_signal(symbol)
-            if signal:
-                send_telegram(signal)
-        except Exception as err:
-            print(f"[ERROR] {symbol}: {err}")
-    time.sleep(60)
+    try:
+        for symbol in symbols:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+            signal, reason = analyze(df)
+            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M')
+
+            if signal and last_signal.get(symbol) != signal:
+                price = df['close'].iloc[-1]
+                tp1, tp2, tp3, sl, [amt1, amt2, amt3] = calculate_targets(price, signal)
+
+                message = (
+                    f"== {signal} SIGNAL ==\n"
+                    f"📈 Pair: {symbol}\n"
+                    f"💰 Harga: {price:.4f}\n"
+                    f"🕒 Waktu: {now} UTC\n"
+                    f"📋 Alasan: {', '.join(reason)}\n\n"
+                    f"🎯 Rekomendasi TP & SL:\n"
+                    f"- TP1 (50%): {tp1} (${amt1})\n"
+                    f"- TP2 (30%): {tp2} (${amt2})\n"
+                    f"- TP3 (20%): {tp3} (${amt3})\n"
+                    f"- SL: {sl}\n\n"
+                    f"✅ Konfirmasi valid — kamu bisa entry sekarang!\n"
+                    f"⚠️ Gunakan money management & trailing SL."
+                )
+
+                send_telegram(message)
+                last_signal[symbol] = signal
+
+        time.sleep(60)
+
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(60)
+		
