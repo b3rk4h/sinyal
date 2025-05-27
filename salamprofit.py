@@ -1,190 +1,188 @@
-import os
-import requests
+import ccxt
+import pandas as pd
+import ta
 import time
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
+import requests
+from datetime import datetime
 
-load_dotenv()
+# === Telegram Config ===
+TELEGRAM_TOKEN = '8074521734:AAHIJRTB9Md96h1b690T2iRRzytMwJACxkc'
+CHAT_ID = '1950841966'
 
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
-TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-
-SYMBOLS = [
-    'SOLUSDT', 'OPUSDT', 'DOGEUSDT', 'SUIUSDT', 'WIFUSDT', 'ETHUSDT',
-    'BTCUSDT', 'AVAXUSDT', 'ARBUSDT', 'PEPEUSDT', 'LINKUSDT', 'SEIUSDT', 'XRPUSDT'
-]
-
-TP_LEVELS = [1.03, 1.06, 1.10]
-SL_PCT = 0.975
-TRAILING_SL_PCTS = [0.985, 0.99, 1.00]
-
-open_positions = {}
-daily_signals = []
-performance_log = []
-last_report_date = None
-MODE = "agresif"  # agresif atau defensif
-
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message}
+def send_telegram(text):
+    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    data = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
     try:
-        requests.post(url, data=payload)
+        requests.post(url, data=data)
     except Exception as e:
-        print("Telegram error:", e)
+        print(f"Telegram error: {e}")
 
+# === Exchange & Market Config ===
+exchange = ccxt.binance({'enableRateLimit': True})
+symbols = ['SOL/USDT', 'SUI/USDT', 'BTC/USDT', 'ETH/USDT', 'OP/USDT', 'WIF/USDT', 'DOGE/USDT']
+timeframe = '15m'
+limit = 120
+last_signal = {}
+hit_tp = {}
 
-def get_candles(symbol, interval='30m', limit=50):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    r = requests.get(url)
-    return r.json()
+# === Modal & Risk Management ===
+TOTAL_CAPITAL = 20  # Total modal Anda
+RISK_PER_TRADE = 0.05  # 5% risiko per trade
 
+# === Hitung TP, SL dan Ukuran Posisi ===
+def calculate_targets(price, signal, atr):
+    if signal == 'BUY':
+        tp1 = price * 1.003
+        tp2 = price * 1.006
+        tp3 = price * 1.009
+        sl = price - atr * 1.2
+    elif signal == 'SELL':
+        tp1 = price * 0.997
+        tp2 = price * 0.994
+        tp3 = price * 0.991
+        sl = price + atr * 1.2
+    else:
+        return None, None, None, None, None, None
 
-def calculate_ma(data, period):
-    closes = [float(c[4]) for c in data]
-    return sum(closes[-period:]) / period
+    risk_amount = TOTAL_CAPITAL * RISK_PER_TRADE
+    position_size = risk_amount / abs(price - sl)
 
+    tp1_amt = position_size * (tp1 - price) if signal == 'BUY' else position_size * (price - tp1)
+    tp2_amt = position_size * (tp2 - price) if signal == 'BUY' else position_size * (price - tp2)
+    tp3_amt = position_size * (tp3 - price) if signal == 'BUY' else position_size * (price - tp3)
 
-def calculate_volume_ma(data, period):
-    volumes = [float(c[5]) for c in data]
-    return sum(volumes[-period:]) / period
+    return (round(tp1, 4), round(tp2, 4), round(tp3, 4), round(sl, 4), round(position_size, 2),
+            [round(tp1_amt, 2), round(tp2_amt, 2), round(tp3_amt, 2)])
 
+# === Analisa Sinyal ===
+def analyze(df):
+    df['ma5'] = df['close'].rolling(5).mean()
+    df['ma20'] = df['close'].rolling(20).mean()
+    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
+    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
+    macd = ta.trend.MACD(df['close'])
+    df['macd'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+    df['volume_ma'] = df['volume'].rolling(10).mean()
+    df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
 
-def get_price(symbol):
-    try:
-        r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}")
-        return float(r.json()['price'])
-    except:
-        return None
+    latest = df.iloc[-1]
+    prev = df.iloc[-2]
 
+    signal = None
+    reason = []
 
-def detect_signal(symbol):
-    try:
-        if symbol in open_positions:
-            return
+    price = latest['close']
+    atr = latest['atr']
+    atr_ratio = atr / price
+    if atr_ratio < 0.002:
+        return None, ["❌ Volatilitas terlalu rendah (<0.2%)"], atr
+    elif atr_ratio > 0.015:
+        return None, ["❌ Volatilitas terlalu tinggi (>1.5%)"], atr
 
-        data_30m = get_candles(symbol, '30m')
-        data_1h = get_candles(symbol, '1h')
+    if (latest['ma5'] > latest['ma20'] and
+        latest['macd'] > latest['macd_signal'] and
+        latest['rsi'] < 70 and
+        latest['adx'] > 20 and
+        latest['close'] > prev['close'] and
+        latest['volume'] > 1.2 * latest['volume_ma']):
+        signal = 'BUY'
+        reason.append("MA5 > MA20")
+        reason.append("MACD bullish")
+        reason.append("ADX > 20 (Trend kuat)")
+        reason.append("Candle + Volume valid")
 
-        ma5_30m = calculate_ma(data_30m, 5)
-        ma20_30m = calculate_ma(data_30m, 20)
-        ma5_1h = calculate_ma(data_1h, 5)
-        ma20_1h = calculate_ma(data_1h, 20)
+    elif (latest['ma5'] < latest['ma20'] and
+          latest['macd'] < latest['macd_signal'] and
+          latest['rsi'] > 30 and
+          latest['adx'] > 20 and
+          latest['close'] < prev['close'] and
+          latest['volume'] > 1.2 * latest['volume_ma']):
+        signal = 'SELL'
+        reason.append("MA5 < MA20")
+        reason.append("MACD bearish")
+        reason.append("ADX > 20 (Trend kuat)")
+        reason.append("Candle + Volume valid")
 
-        close_30m = float(data_30m[-1][4])
-        open_30m = float(data_30m[-1][1])
-        volume_now = float(data_30m[-1][5])
-        volume_ma10 = calculate_volume_ma(data_30m, 10)
+    return signal, reason, atr
 
-        candle_body_pct = abs(close_30m - open_30m) / open_30m
-        bullish = close_30m > open_30m and candle_body_pct > 0.002
-        bearish = close_30m < open_30m and candle_body_pct > 0.002
-        volume_ok = volume_now > volume_ma10 * (1.05 if MODE == "agresif" else 1.2)
-
-        price = get_price(symbol)
-        if not price:
-            return
-
-        qty = 1  # dummy qty untuk simulasi
-
-        if ma5_30m > ma20_30m and ma5_1h > ma20_1h and bullish and volume_ok:
-            open_positions[symbol] = {
-                'entry': price,
-                'tps_hit': [],
-                'last_price': price,
-                'sl_level': SL_PCT,
-                'qty': qty,
-                'side': 'LONG',
-                'time': datetime.now()
-            }
-            daily_signals.append(symbol)
-            send_telegram(f"🔔 LONG BUY {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * x, 2) for x in TP_LEVELS]}\nSL: {price * SL_PCT:.2f}")
-
-        elif ma5_30m < ma20_30m and ma5_1h < ma20_1h and bearish and volume_ok:
-            open_positions[symbol] = {
-                'entry': price,
-                'tps_hit': [],
-                'last_price': price,
-                'sl_level': 2 - SL_PCT,
-                'qty': qty,
-                'side': 'SHORT',
-                'time': datetime.now()
-            }
-            daily_signals.append(symbol)
-            send_telegram(f"🔔 SHORT SELL {symbol}\nEntry: ${price:.2f}\nTP1-3: {[round(price * (2-x), 2) for x in TP_LEVELS]}\nSL: {price * (2 - SL_PCT):.2f}")
-
-    except Exception as e:
-        print(f"[ERROR] {symbol}: {e}")
-
-
-def check_tp_sl():
-    for symbol, pos in list(open_positions.items()):
-        price = get_price(symbol)
-        if not price:
-            continue
-
-        entry = pos['entry']
-        pos['last_price'] = price
-
-        if len(pos['tps_hit']) < len(TRAILING_SL_PCTS):
-            pos['sl_level'] = TRAILING_SL_PCTS[len(pos['tps_hit'])] if pos['side'] == 'LONG' else 2 - TRAILING_SL_PCTS[len(pos['tps_hit'])]
-
-        sl_hit = price <= entry * pos['sl_level'] if pos['side'] == 'LONG' else price >= entry * pos['sl_level']
-        if sl_hit:
-            send_telegram(f"❌ STOP LOSS HIT {symbol} ({pos['side']})\nEntry: ${entry:.2f}, Exit: ${price:.2f}\nLoss: {((price-entry)/entry)*100:.2f}%")
-            performance_log.append(((price-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
-            del open_positions[symbol]
-            continue
-
-        for i, level in enumerate(TP_LEVELS):
-            target = entry * level if pos['side'] == 'LONG' else entry * (2 - level)
-            if i not in pos['tps_hit'] and ((price >= target and pos['side'] == 'LONG') or (price <= target and pos['side'] == 'SHORT')):
-                send_telegram(f"✅ TP{i+1} HIT {symbol} ({pos['side']})\nTarget: ${target:.2f}")
-                pos['tps_hit'].append(i)
-                if i == len(TP_LEVELS) - 1:
-                    performance_log.append(((target-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
-                    del open_positions[symbol]
-
-        try:
-            data_30m = get_candles(symbol, '30m')
-            ma5_now = calculate_ma(data_30m, 5)
-            ma20_now = calculate_ma(data_30m, 20)
-            trend_reversal = (ma5_now < ma20_now if pos['side'] == 'LONG' else ma5_now > ma20_now)
-            if trend_reversal:
-                send_telegram(f"🔁 AUTO CLOSE {symbol} ({pos['side']}) Trend reversal\nExit: ${price:.2f}")
-                performance_log.append(((price-entry)/entry)*100 * (1 if pos['side'] == 'LONG' else -1))
-                del open_positions[symbol]
-        except Exception as e:
-            print(f"Trend reversal check error: {e}")
-
-
-print("🚀 Bot sinyal (LONG & SHORT) dengan mode agresif/defensif siap jalan...")
+# === Main Bot ===
+print("\n✅ Bot sinyal trading dimulai dengan early signal, TP 0.3%–0.9%, ADX + ATR filter...")
 while True:
-    now = datetime.utcnow() + timedelta(hours=7)
-    if now.minute % 30 == 0:
-        for sym in SYMBOLS:
-            detect_signal(sym)
-        check_tp_sl()
+    try:
+        for symbol in symbols:
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
 
-    if now.hour == 0 and now.minute == 0 and (last_report_date != now.date()):
-        total = len(performance_log)
-        win = len([x for x in performance_log if x > 0])
-        loss = total - win
-        avg_gain = sum(performance_log) / total if total else 0
+            signal, reason, atr = analyze(df)
+            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M')
+            price = df['close'].iloc[-1]
 
-        summary = f"📊 Laporan Harian ({now.strftime('%Y-%m-%d')})\n"
-        summary += f"Sinyal muncul: {len(daily_signals)}\n"
-        summary += f"Open Posisi: {len(open_positions)}\n"
-        summary += f"TP/SL Tercapai: {total}\n"
-        summary += f"Win: {win}, Loss: {loss}\n"
-        summary += f"Avg Gain/Loss: {avg_gain:.2f}%"
+            if signal and last_signal.get(symbol) != signal:
+                tp1, tp2, tp3, sl, position_size, [amt1, amt2, amt3] = calculate_targets(price, signal, atr)
 
-        if not daily_signals:
-            summary += "\n⚠️ Tidak ada sinyal valid hari ini."
+                color_tag = '🟢 BUY SIGNAL' if signal == 'BUY' else '🔴 SELL SIGNAL'
 
-        send_telegram(summary)
-        last_report_date = now.date()
-        daily_signals.clear()
-        performance_log.clear()
+                message = (
+                    f"== {color_tag} ==\n"
+                    f"📈 Pair: {symbol}\n"
+                    f"💰 Harga: {price:.4f}\n"
+                    f"📏 Posisi: {position_size} USDT\n"
+                    f"🕒 Waktu: {now} WIB\n"
+                    f"📋 Alasan: {', '.join(reason)}\n\n"
+                    f"🎯 TP & SL:\n"
+                    f"- TP1: {tp1} (+${amt1})\n"
+                    f"- TP2: {tp2} (+${amt2})\n"
+                    f"- TP3: {tp3} (+${amt3})\n"
+                    f"- SL: {sl} (risk ${TOTAL_CAPITAL * RISK_PER_TRADE})\n\n"
+                    f"✅ Entry disarankan sekarang.\n"
+                    f"📌 Gunakan SL & trailing untuk amankan profit."
+                )
 
-    time.sleep(60)
+                send_telegram(message)
+                last_signal[symbol] = signal
+                hit_tp[symbol] = {'tp1': False, 'tp2': False, 'tp3': False}
+
+            elif signal:
+                preview_tag = '🟢 Early BUY Preview' if signal == 'BUY' else '🔴 Early SELL Preview'
+                preview_msg = (
+                    f"== {preview_tag} ==\n"
+                    f"📈 Pair: {symbol}\n"
+                    f"💰 Harga saat ini: {price:.4f}\n"
+                    f"📋 Potensi sinyal: {', '.join(reason)}\n"
+                    f"⏳ Menunggu konfirmasi candle berikut..."
+                )
+                send_telegram(preview_msg)
+
+            # Pantau apakah TP1/TP2/TP3 tercapai
+            if symbol in last_signal:
+                signal = last_signal[symbol]
+                tp1, tp2, tp3, sl, _, _ = calculate_targets(price, signal, atr)
+
+                if signal == 'BUY':
+                    if not hit_tp[symbol]['tp1'] and price >= tp1:
+                        send_telegram(f"✅ TP1 tercapai di {symbol} — pertimbangkan naikkan SL!")
+                        hit_tp[symbol]['tp1'] = True
+                    if not hit_tp[symbol]['tp2'] and price >= tp2:
+                        send_telegram(f"✅ TP2 tercapai di {symbol} — SL bisa trailing di atas TP1!")
+                        hit_tp[symbol]['tp2'] = True
+                    if not hit_tp[symbol]['tp3'] and price >= tp3:
+                        send_telegram(f"✅ TP3 tercapai di {symbol} — take full profit disarankan.")
+                        hit_tp[symbol]['tp3'] = True
+                elif signal == 'SELL':
+                    if not hit_tp[symbol]['tp1'] and price <= tp1:
+                        send_telegram(f"✅ TP1 tercapai di {symbol} — pertimbangkan turun SL!")
+                        hit_tp[symbol]['tp1'] = True
+                    if not hit_tp[symbol]['tp2'] and price <= tp2:
+                        send_telegram(f"✅ TP2 tercapai di {symbol} — SL bisa trailing di bawah TP1!")
+                        hit_tp[symbol]['tp2'] = True
+                    if not hit_tp[symbol]['tp3'] and price <= tp3:
+                        send_telegram(f"✅ TP3 tercapai di {symbol} — take full profit disarankan.")
+                        hit_tp[symbol]['tp3'] = True
+
+        time.sleep(60)
+
+    except Exception as e:
+        print(f"Error: {e}")
+        time.sleep(60)
