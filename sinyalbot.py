@@ -102,13 +102,16 @@ def check_signal(symbol):
         risk_dollar = MODAL_TOTAL * RISK_PER_TRADE
 		sl = price - atr if cond_up else price + atr
 		price_sl_diff = abs(price - sl)
-
+		
 		if price_sl_diff == 0:
 			print(f"[WARNING] {symbol} - SL sama dengan entry price! Size diset ke 0 untuk hindari error.")
 			size = 0
 		else:
 			size = round((risk_dollar / price_sl_diff) * LEVERAGE, 2)
 
+		if size == 0:
+			print(f"[INFO] {symbol} dilewati karena size 0 akibat SL terlalu dekat.")
+			return
 
         if cond_up or cond_down:
             cooldowns[symbol] = now
