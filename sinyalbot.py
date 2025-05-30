@@ -1,4 +1,51 @@
-ow'] = df['low'].astype(float)
+# FINAL VERSION - SUPER AKURAT++ TRADING SIGNAL BOT
+# AKURASI TINGGI - KONFIRMASI MTF - TRAILING TP - TELEGRAM ALERT
+
+import time
+import math
+import requests
+import os
+import pandas as pd
+from datetime import datetime
+from dotenv import load_dotenv
+from binance.client import Client
+from ta.trend import ADXIndicator, SMAIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+
+# === CONFIGURATION === #
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RISK_PER_TRADE = 0.03  # 3% dari modal
+MODAL_TOTAL = 20  # modal awal total $20
+LEVERAGE = 20
+TP1_PCT = 0.02
+TP2_PCT = 0.04
+TP3_PCT = 0.06
+
+client = Client(API_KEY, API_SECRET)
+cooldowns = {}
+
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    requests.post(url, data=data)
+
+def get_all_usdt_futures_symbols():
+    info = client.futures_exchange_info()
+    return [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL']
+
+def fetch_klines(symbol, interval, limit=200):
+    klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume', '_', '_', '_', '_', '_', '_'
+    ])
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
     df['volume'] = df['volume'].astype(float)
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
