@@ -9,9 +9,11 @@ import pandas as pd
 from datetime import datetime
 from dotenv import load_dotenv
 from binance.client import Client
+from binance.enums import FuturesType
 from ta.trend import ADXIndicator, SMAIndicator
 from ta.momentum import RSIIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator
 
 # === CONFIGURATION === #
 load_dotenv()
@@ -19,12 +21,8 @@ API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-RISK_PER_TRADE = 0.03  # 3% dari modal
 MODAL_TOTAL = 20  # modal awal total $20
 LEVERAGE = 20
-TP1_PCT = 0.02
-TP2_PCT = 0.04
-TP3_PCT = 0.06
 
 client = Client(API_KEY, API_SECRET)
 cooldowns = {}
@@ -37,6 +35,17 @@ def send_telegram(msg):
 def get_all_usdt_futures_symbols():
     info = client.futures_exchange_info()
     return [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL']
+
+def filter_symbols(symbols):
+    filtered = []
+    for symbol in symbols:
+        try:
+            ticker = client.futures_ticker(symbol=symbol)
+            if float(ticker['quoteVolume']) > 5000000:  # filter min volume
+                filtered.append(symbol)
+        except:
+            continue
+    return filtered
 
 def fetch_klines(symbol, interval, limit=200):
     klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
@@ -63,6 +72,7 @@ def analyze(df):
     df['breakout_up'] = df['close'] > df['bb_upper']
     df['breakout_down'] = df['close'] < df['bb_lower']
     df['strong_adx'] = df['adx'] > 25
+    df['volatility_ok'] = df['atr'] > df['atr'].rolling(20).mean()
     return df
 
 def check_signal(symbol):
@@ -76,6 +86,23 @@ def check_signal(symbol):
         df_5m = analyze(fetch_klines(symbol, '5m'))
         df_15m = analyze(fetch_klines(symbol, '15m'))
         df_1h = analyze(fetch_klines(symbol, '1h'))
+        df_4h = analyze(fetch_klines(symbol, '4h'))
+
+        trend_1h = df_1h.iloc[-1]['trend_up']
+        trend_4h = df_4h.iloc[-1]['trend_up']
+        adx_1h = df_1h.iloc[-1]['adx']
+        adx_4h = df_4h.iloc[-1]['adx']
+
+        # Adaptive risk
+        if trend_1h and trend_4h and adx_1h > 30 and adx_4h > 30:
+            risk_pct = 0.05
+            trend_strength = "💪 KUAT (HIGH RISK)"
+        elif trend_1h or trend_4h:
+            risk_pct = 0.03
+            trend_strength = "⚖️ MODERAT"
+        else:
+            risk_pct = 0.01
+            trend_strength = "⚠️ LEMAH (LOW RISK)"
 
         cond_up = (
             df_1m.iloc[-1]['trend_up'] and
@@ -84,7 +111,8 @@ def check_signal(symbol):
             df_1h.iloc[-1]['trend_up'] and
             df_1m.iloc[-1]['breakout_up'] and
             df_1m.iloc[-1]['volume_spike'] and
-            df_1m.iloc[-1]['strong_adx']
+            df_1m.iloc[-1]['strong_adx'] and
+			df_1m.iloc[-1]['volatility_ok']
         )
 
         cond_down = (
@@ -94,12 +122,38 @@ def check_signal(symbol):
             not df_1h.iloc[-1]['trend_up'] and
             df_1m.iloc[-1]['breakout_down'] and
             df_1m.iloc[-1]['volume_spike'] and
-            df_1m.iloc[-1]['strong_adx']
+            df_1m.iloc[-1]['strong_adx'] and
+			df_1m.iloc[-1]['volatility_ok']
+        )
+
+        # Tambahan EARLY SIGNAL PREVIEW
+        early_long = (
+            sum([
+                df_1m.iloc[-1]['trend_up'],
+                df_5m.iloc[-1]['trend_up'],
+                df_15m.iloc[-1]['trend_up'],
+                df_1h.iloc[-1]['trend_up']
+            ]) >= 3 and
+            df_1m.iloc[-1]['volume_spike'] and
+            df_1m.iloc[-1]['rsi'] > 60 and
+            not cond_up
+        )
+
+        early_short = (
+            sum([
+                not df_1m.iloc[-1]['trend_up'],
+                not df_5m.iloc[-1]['trend_up'],
+                not df_15m.iloc[-1]['trend_up'],
+                not df_1h.iloc[-1]['trend_up']
+            ]) >= 3 and
+            df_1m.iloc[-1]['volume_spike'] and
+            df_1m.iloc[-1]['rsi'] < 40 and
+            not cond_down
         )
 
         price = df_1m.iloc[-1]['close']
         atr = df_1m.iloc[-1]['atr']
-        risk_dollar = MODAL_TOTAL * RISK_PER_TRADE
+        risk_dollar = MODAL_TOTAL * risk_pct
         sl = price - atr if cond_up else price + atr
         price_sl_diff = abs(price - sl)
 
@@ -117,9 +171,9 @@ def check_signal(symbol):
             cooldowns[symbol] = now
 
         if cond_up:
-            tp1 = price * (1 + TP1_PCT)
-            tp2 = price * (1 + TP2_PCT)
-            tp3 = price * (1 + TP3_PCT)
+            tp1 = price + atr * 1.5
+            tp2 = price + atr * 2.5
+            tp3 = price + atr * 4
             msg = (
                 f"\n🚀 <b><u>LONG SIGNAL</u></b> - <b>{symbol}</b>\n"
                 f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\nSize: <b>{size}</b>\n"
@@ -130,9 +184,9 @@ def check_signal(symbol):
             send_telegram(msg)
 
         elif cond_down:
-            tp1 = price * (1 - TP1_PCT)
-            tp2 = price * (1 - TP2_PCT)
-            tp3 = price * (1 - TP3_PCT)
+            tp1 = price - atr * 1.5
+            tp2 = price - atr * 2.5
+            tp3 = price - atr * 4
             msg = (
                 f"\n🔻 <b><u>SHORT SIGNAL</u></b> - <b>{symbol}</b>\n"
                 f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\nSize: <b>{size}</b>\n"
@@ -142,20 +196,49 @@ def check_signal(symbol):
             )
             send_telegram(msg)
 
-        with open("log_sinyal.txt", "a") as f:
-            f.write(f"{datetime.now()} | {symbol} | {'LONG' if cond_up else 'SHORT'} | {price:.2f} | SL: {sl:.2f} | Size: {size}\n")
+        # Early Signal Notifikasi
+        elif early_long:
+            msg = (
+                f"\n🟡 <b>EARLY SIGNAL PREVIEW</b> - <b>{symbol}</b>\n"
+                f"🚀 Potensi arah: <b>LONG</b>\n📉 RSI: {df_1m.iloc[-1]['rsi']:.2f} | Volume spike terdeteksi\n"
+                f"📊 Trend 1m-1h: mayoritas Bullish (3/4)\n"
+                f"💡 Menunggu breakout & konfirmasi ADX\n🕒 Siap-siap entry dalam 1-3 menit ke depan."
+            )
+            send_telegram(msg)
+
+        elif early_short:
+            msg = (
+                f"\n🟠 <b>EARLY SIGNAL PREVIEW</b> - <b>{symbol}</b>\n"
+                f"🔻 Potensi arah: <b>SHORT</b>\n📉 RSI: {df_1m.iloc[-1]['rsi']:.2f} | Volume spike terdeteksi\n"
+                f"📊 Trend 1m-1h: mayoritas Bearish (3/4)\n"
+                f"💡 Menunggu breakdown & konfirmasi ADX\n🕒 Siap-siap entry dalam 1-3 menit ke depan."
+            )
+            send_telegram(msg)
+			
+        # Notifikasi Reversal
+        last_trend = df_1m.iloc[-2]['trend_up']
+        current_trend = df_1m.iloc[-1]['trend_up']
+        if last_trend != current_trend:
+            direction = "LONG ➡ SHORT" if not current_trend else "SHORT ➡ LONG"
+            revmsg = f"\n🔄 <b>REVERSAL DETECTED</b> - <b>{symbol}</b>\n📉 Market reversal: <b>{direction}</b>\n💡 Periksa posisi & pertimbangkan trailing SL."
+            send_telegram(revmsg)
+			
+        if cond_up or cond_down:
+            with open("log_sinyal.txt", "a") as f:
+                f.write(f"{datetime.now()} | {symbol} | {'LONG' if cond_up else 'SHORT'} | {price:.2f} | SL: {sl:.2f} | Size: {size}\n")
 
     except Exception as e:
-        print(f"Error {symbol}: {e}")
+        print(f"[ERROR] Saat cek sinyal {symbol}: {str(e)}")
 
 # Loop utama
 while True:
     try:
         client.futures_ping()
-        symbols = get_all_usdt_futures_symbols()
-        sampled = symbols[:30]  # Batasi simbol agar tidak overload
+        symbols = filter_symbols(get_all_usdt_futures_symbols())
+        sampled = symbols[:20]  # Batasi simbol agar tidak overload
         for sym in sampled:
             check_signal(sym)
+			time.sleep(0.5)
         time.sleep(60)
     except Exception as err:
         print(f"Main loop error: {err}")
