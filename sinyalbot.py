@@ -1,6 +1,3 @@
-# FINAL VERSION - SUPER AKURAT++ TRADING SIGNAL BOT
-# AKURASI TINGGI - KONFIRMASI MTF - TRAILING TP - TELEGRAM ALERT
-
 import time
 import math
 import requests
@@ -112,7 +109,7 @@ def check_signal(symbol):
             df_1m.iloc[-1]['breakout_up'] and
             df_1m.iloc[-1]['volume_spike'] and
             df_1m.iloc[-1]['strong_adx'] and
-			df_1m.iloc[-1]['volatility_ok']
+            df_1m.iloc[-1]['volatility_ok']
         )
 
         cond_down = (
@@ -123,32 +120,7 @@ def check_signal(symbol):
             df_1m.iloc[-1]['breakout_down'] and
             df_1m.iloc[-1]['volume_spike'] and
             df_1m.iloc[-1]['strong_adx'] and
-			df_1m.iloc[-1]['volatility_ok']
-        )
-
-        # Tambahan EARLY SIGNAL PREVIEW
-        early_long = (
-            sum([
-                df_1m.iloc[-1]['trend_up'],
-                df_5m.iloc[-1]['trend_up'],
-                df_15m.iloc[-1]['trend_up'],
-                df_1h.iloc[-1]['trend_up']
-            ]) >= 3 and
-            df_1m.iloc[-1]['volume_spike'] and
-            df_1m.iloc[-1]['rsi'] > 60 and
-            not cond_up
-        )
-
-        early_short = (
-            sum([
-                not df_1m.iloc[-1]['trend_up'],
-                not df_5m.iloc[-1]['trend_up'],
-                not df_15m.iloc[-1]['trend_up'],
-                not df_1h.iloc[-1]['trend_up']
-            ]) >= 3 and
-            df_1m.iloc[-1]['volume_spike'] and
-            df_1m.iloc[-1]['rsi'] < 40 and
-            not cond_down
+            df_1m.iloc[-1]['volatility_ok']
         )
 
         price = df_1m.iloc[-1]['close']
@@ -196,33 +168,7 @@ def check_signal(symbol):
             )
             send_telegram(msg)
 
-        # Early Signal Notifikasi
-        elif early_long:
-            msg = (
-                f"\n🟡 <b>EARLY SIGNAL PREVIEW</b> - <b>{symbol}</b>\n"
-                f"🚀 Potensi arah: <b>LONG</b>\n📉 RSI: {df_1m.iloc[-1]['rsi']:.2f} | Volume spike terdeteksi\n"
-                f"📊 Trend 1m-1h: mayoritas Bullish (3/4)\n"
-                f"💡 Menunggu breakout & konfirmasi ADX\n🕒 Siap-siap entry dalam 1-3 menit ke depan."
-            )
-            send_telegram(msg)
-
-        elif early_short:
-            msg = (
-                f"\n🟠 <b>EARLY SIGNAL PREVIEW</b> - <b>{symbol}</b>\n"
-                f"🔻 Potensi arah: <b>SHORT</b>\n📉 RSI: {df_1m.iloc[-1]['rsi']:.2f} | Volume spike terdeteksi\n"
-                f"📊 Trend 1m-1h: mayoritas Bearish (3/4)\n"
-                f"💡 Menunggu breakdown & konfirmasi ADX\n🕒 Siap-siap entry dalam 1-3 menit ke depan."
-            )
-            send_telegram(msg)
-			
-        # Notifikasi Reversal
-        last_trend = df_1m.iloc[-2]['trend_up']
-        current_trend = df_1m.iloc[-1]['trend_up']
-        if last_trend != current_trend:
-            direction = "LONG ➡ SHORT" if not current_trend else "SHORT ➡ LONG"
-            revmsg = f"\n🔄 <b>REVERSAL DETECTED</b> - <b>{symbol}</b>\n📉 Market reversal: <b>{direction}</b>\n💡 Periksa posisi & pertimbangkan trailing SL."
-            send_telegram(revmsg)
-			
+        # Log ke file jika ada sinyal valid
         if cond_up or cond_down:
             with open("log_sinyal.txt", "a") as f:
                 f.write(f"{datetime.now()} | {symbol} | {'LONG' if cond_up else 'SHORT'} | {price:.2f} | SL: {sl:.2f} | Size: {size}\n")
