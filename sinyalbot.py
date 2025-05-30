@@ -1,128 +1,149 @@
-import ccxt
-import pandas as pd
-import ta
 import time
+import math
 import requests
+import os
+import pandas as pd
 from datetime import datetime
+from dotenv import load_dotenv
+from binance.client import Client
+from ta.trend import ADXIndicator, SMAIndicator
+from ta.momentum import RSIIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
 
-# === Telegram Config ===
-TELEGRAM_TOKEN = '8074521734:AAHIJRTB9Md96h1b690T2iRRzytMwJACxkc'
-CHAT_ID = '1950841966'
+# === CONFIGURATION === #
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+RISK_PER_TRADE = 0.03  # 3% dari modal
+MODAL_TOTAL = 20  # modal awal total $20
+LEVERAGE = 20
+TP1_PCT = 0.02
+TP2_PCT = 0.04
+TP3_PCT = 0.06
 
-def send_telegram(text):
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': text}
-    try:
-        requests.post(url, data=data)
-    except Exception as e:
-        print(f"Telegram error: {e}")
+client = Client(API_KEY, API_SECRET)
+cooldowns = {}
 
-# === Exchange & Market Config ===
-exchange = ccxt.binance({'enableRateLimit': True})
-symbols = ['SOL/USDT', 'OP/USDT', 'DOGE/USDT', 'PEPE/USDT', 'WIF/USDT']
-timeframe = '15m'
-limit = 120
-last_signal = {}
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    requests.post(url, data=data)
 
-# === Hitung TP & SL ===
-def calculate_targets(price, signal, total_amount=20):
-    if signal == 'BUY':
-        tp1 = price * 1.015
-        tp2 = price * 1.03
-        tp3 = price * 1.05
-        sl = price * 0.98
-    elif signal == 'SELL':
-        tp1 = price * 0.985
-        tp2 = price * 0.97
-        tp3 = price * 0.95
-        sl = price * 1.02
-    else:
-        return None, None, None, None, None
+def get_all_usdt_futures_symbols():
+    info = client.futures_exchange_info()
+    return [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL']
 
-    tp1_amt = total_amount * 0.5
-    tp2_amt = total_amount * 0.3
-    tp3_amt = total_amount * 0.2
+def fetch_klines(symbol, interval, limit=200):
+    klines = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
+    df = pd.DataFrame(klines, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume', '_', '_', '_', '_', '_', '_'
+    ])
+    df['close'] = df['close'].astype(float)
+    df['high'] = df['high'].astype(float)
+    df['low'] = df['low'].astype(float)
+    df['volume'] = df['volume'].astype(float)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    return df
 
-    return (round(tp1, 4), round(tp2, 4), round(tp3, 4), round(sl, 4),
-            [tp1_amt, tp2_amt, tp3_amt])
-
-# === Analisa Sinyal ===
 def analyze(df):
-    df['ma5'] = df['close'].rolling(5).mean()
-    df['ma20'] = df['close'].rolling(20).mean()
-    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    bb = ta.volatility.BollingerBands(df['close'], window=20)
-    df['bb_upper'] = bb.bollinger_hband()
-    df['bb_lower'] = bb.bollinger_lband()
-    df['volume_ma'] = df['volume'].rolling(10).mean()
+    df['ma_fast'] = SMAIndicator(df['close'], 5).sma_indicator()
+    df['ma_slow'] = SMAIndicator(df['close'], 20).sma_indicator()
+    df['rsi'] = RSIIndicator(df['close']).rsi()
+    df['adx'] = ADXIndicator(df['high'], df['low'], df['close']).adx()
+    df['atr'] = AverageTrueRange(df['high'], df['low'], df['close']).average_true_range()
+    df['bb_upper'] = BollingerBands(df['close']).bollinger_hband()
+    df['bb_lower'] = BollingerBands(df['close']).bollinger_lband()
+    df['volume_spike'] = df['volume'] > df['volume'].rolling(20).mean() * 1.5
+    df['trend_up'] = df['ma_fast'] > df['ma_slow']
+    df['breakout_up'] = df['close'] > df['bb_upper']
+    df['breakout_down'] = df['close'] < df['bb_lower']
+    df['strong_adx'] = df['adx'] > 25
+    return df
 
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
+def check_signal(symbol):
+    try:
+        now = time.time()
+        cooldown_period = 300  # 5 menit
+        if symbol in cooldowns and now - cooldowns[symbol] < cooldown_period:
+            return
 
-    signal = None
-    reason = []
+        df_1m = analyze(fetch_klines(symbol, '1m'))
+        df_5m = analyze(fetch_klines(symbol, '5m'))
+        df_15m = analyze(fetch_klines(symbol, '15m'))
+        df_1h = analyze(fetch_klines(symbol, '1h'))
 
-    if (latest['ma5'] > latest['ma20'] and
-        latest['rsi'] < 70 and
-        latest['close'] > latest['ma5'] and
-        latest['close'] > prev['close'] and
-        latest['volume'] > 1.2 * latest['volume_ma']):
-        signal = 'BUY'
-        reason.append("MA5 > MA20")
-        reason.append("RSI OK")
-        reason.append("Break MA + Volume Spike")
-        reason.append("Konfirmasi Bullish")
+        cond_up = (
+            df_1m.iloc[-1]['trend_up'] and
+            df_5m.iloc[-1]['trend_up'] and
+            df_15m.iloc[-1]['trend_up'] and
+            df_1h.iloc[-1]['trend_up'] and
+            df_1m.iloc[-1]['breakout_up'] and
+            df_1m.iloc[-1]['volume_spike'] and
+            df_1m.iloc[-1]['strong_adx']
+        )
 
-    elif (latest['ma5'] < latest['ma20'] and
-          latest['rsi'] > 30 and
-          latest['close'] < latest['ma5'] and
-          latest['close'] < prev['close'] and
-          latest['volume'] > 1.2 * latest['volume_ma']):
-        signal = 'SELL'
-        reason.append("MA5 < MA20")
-        reason.append("RSI OK")
-        reason.append("Breakdown + Volume Spike")
-        reason.append("Konfirmasi Bearish")
+        cond_down = (
+            not df_1m.iloc[-1]['trend_up'] and
+            not df_5m.iloc[-1]['trend_up'] and
+            not df_15m.iloc[-1]['trend_up'] and
+            not df_1h.iloc[-1]['trend_up'] and
+            df_1m.iloc[-1]['breakout_down'] and
+            df_1m.iloc[-1]['volume_spike'] and
+            df_1m.iloc[-1]['strong_adx']
+        )
 
-    return signal, reason
+        price = df_1m.iloc[-1]['close']
+        atr = df_1m.iloc[-1]['atr']
+        risk_dollar = MODAL_TOTAL * RISK_PER_TRADE
+        sl = price - atr if cond_up else price + atr
+        size = round((risk_dollar / abs(price - sl)) * LEVERAGE, 2)
 
-# === Main Bot ===
-print("\n✅ Bot sinyal trading dimulai...")
+        if cond_up or cond_down:
+            cooldowns[symbol] = now
+
+        if cond_up:
+            tp1 = price * (1 + TP1_PCT)
+            tp2 = price * (1 + TP2_PCT)
+            tp3 = price * (1 + TP3_PCT)
+            msg = (
+                f"\n🚀 <b><u>LONG SIGNAL</u></b> - <b>{symbol}</b>\n"
+                f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\nSize: <b>{size}</b>\n"
+                f"🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n📈 Trend: Bullish\n"
+                f"📊 Konfirmasi: ✅✅✅✅\n🎯 Sinyal: <b>KUAT</b> 🔥🔥🔥\n"
+                f"🔁 Trailing aktif setelah TP1"
+            )
+            send_telegram(msg)
+
+        elif cond_down:
+            tp1 = price * (1 - TP1_PCT)
+            tp2 = price * (1 - TP2_PCT)
+            tp3 = price * (1 - TP3_PCT)
+            msg = (
+                f"\n🔻 <b><u>SHORT SIGNAL</u></b> - <b>{symbol}</b>\n"
+                f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\nSize: <b>{size}</b>\n"
+                f"🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n📉 Trend: Bearish\n"
+                f"📊 Konfirmasi: ✅✅✅✅\n🎯 Sinyal: <b>KUAT</b> ❄️❄️❄️\n"
+                f"🔁 Trailing aktif setelah TP1"
+            )
+            send_telegram(msg)
+
+        with open("log_sinyal.txt", "a") as f:
+            f.write(f"{datetime.now()} | {symbol} | {'LONG' if cond_up else 'SHORT'} | {price:.2f} | SL: {sl:.2f} | Size: {size}\n")
+
+    except Exception as e:
+        print(f"Error {symbol}: {e}")
+
+# Loop utama
 while True:
     try:
-        for symbol in symbols:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-            signal, reason = analyze(df)
-            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M')
-
-            if signal and last_signal.get(symbol) != signal:
-                price = df['close'].iloc[-1]
-                tp1, tp2, tp3, sl, [amt1, amt2, amt3] = calculate_targets(price, signal)
-
-                message = (
-                    f"== {signal} SIGNAL ==\n"
-                    f"📈 Pair: {symbol}\n"
-                    f"💰 Harga: {price:.4f}\n"
-                    f"🕒 Waktu: {now} UTC\n"
-                    f"📋 Alasan: {', '.join(reason)}\n\n"
-                    f"🎯 Rekomendasi TP & SL:\n"
-                    f"- TP1 (50%): {tp1} (${amt1})\n"
-                    f"- TP2 (30%): {tp2} (${amt2})\n"
-                    f"- TP3 (20%): {tp3} (${amt3})\n"
-                    f"- SL: {sl}\n\n"
-                    f"✅ Konfirmasi valid — kamu bisa entry sekarang!\n"
-                    f"⚠️ Gunakan money management & trailing SL."
-                )
-
-                send_telegram(message)
-                last_signal[symbol] = signal
-
+        client.futures_ping()
+        symbols = get_all_usdt_futures_symbols()
+        sampled = symbols[:30]  # Batasi simbol agar tidak overload
+        for sym in sampled:
+            check_signal(sym)
         time.sleep(60)
-
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception as err:
+        print(f"Main loop error: {err}")
         time.sleep(60)
-		
