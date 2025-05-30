@@ -238,7 +238,7 @@ while True:
         sampled = symbols[:20]  # Batasi simbol agar tidak overload
         for sym in sampled:
             check_signal(sym)
-			time.sleep(0.5)
+            time.sleep(0.5)
         time.sleep(60)
     except Exception as err:
         print(f"Main loop error: {err}")
