@@ -20,6 +20,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MODAL_TOTAL = 20  # modal awal total $20
 LEVERAGE = 20
+active_signals = []  # Menyimpan sinyal yang masih aktif untuk dipantau TP-nya
 
 client = Client(API_KEY, API_SECRET)
 cooldowns = {}
@@ -93,13 +94,10 @@ def check_signal(symbol):
         # Adaptive risk
         if trend_1h and trend_4h and adx_1h > 30 and adx_4h > 30:
             risk_pct = 0.05
-            trend_strength = "💪 KUAT (HIGH RISK)"
         elif trend_1h or trend_4h:
             risk_pct = 0.03
-            trend_strength = "⚖️ MODERAT"
         else:
             risk_pct = 0.01
-            trend_strength = "⚠️ LEMAH (LOW RISK)"
 
         cond_up = (
             df_1m.iloc[-1]['trend_up'] and
@@ -123,58 +121,125 @@ def check_signal(symbol):
             df_1m.iloc[-1]['volatility_ok']
         )
 
+        early_long = (
+            df_1m.iloc[-1]['trend_up'] and
+            df_5m.iloc[-1]['trend_up'] and
+            not df_15m.iloc[-1]['trend_up'] and
+            df_1m.iloc[-1]['volume_spike'] and
+            df_1m.iloc[-1]['strong_adx'] and
+            df_1m.iloc[-1]['volatility_ok']
+        )
+
+        early_short = (
+            not df_1m.iloc[-1]['trend_up'] and
+            not df_5m.iloc[-1]['trend_up'] and
+            df_15m.iloc[-1]['trend_up'] and
+            df_1m.iloc[-1]['volume_spike'] and
+            df_1m.iloc[-1]['strong_adx'] and
+            df_1m.iloc[-1]['volatility_ok']
+        )
+
         price = df_1m.iloc[-1]['close']
-        atr = df_1m.iloc[-1]['atr']
+        atr_4h = df_4h.iloc[-1]['atr']  # ATR dari 4H sebagai acuan SL/TP
         risk_dollar = MODAL_TOTAL * risk_pct
-        sl = price - atr if cond_up else price + atr
-        price_sl_diff = abs(price - sl)
+        sl_main = price - atr_4h if cond_up else price + atr_4h
+        price_sl_diff = abs(price - sl_main)
 
         if price_sl_diff == 0:
-            print(f"[WARNING] {symbol} - SL sama dengan entry price! Size diset ke 0 untuk hindari error.")
-            size = 0
-        else:
-            size = round((risk_dollar / price_sl_diff) * LEVERAGE, 2)
+            print(f"[WARNING] {symbol} - SL = Entry price. Size diset ke 0.")
+            return
 
+        size = round((risk_dollar / price_sl_diff) * LEVERAGE, 2)
         if size == 0:
             print(f"[INFO] {symbol} dilewati karena size 0 akibat SL terlalu dekat.")
             return
 
+        # === SINYAL KUAT ===
         if cond_up or cond_down:
             cooldowns[symbol] = now
+            tp1 = price + atr_4h * 1.5 if cond_up else price - atr_4h * 1.5
+            tp2 = price + atr_4h * 2.5 if cond_up else price - atr_4h * 2.5
+            tp3 = price + atr_4h * 4 if cond_up else price - atr_4h * 4
+            sl = price - atr_4h if cond_up else price + atr_4h
+            direction = "LONG" if cond_up else "SHORT"
+            trend_text = "Bullish" if cond_up else "Bearish"
+            emoji = "🚀" if cond_up else "🔻"
+            strength_emoji = "🔥🔥🔥" if cond_up else "❄️❄️❄️"
 
-        if cond_up:
-            tp1 = price + atr * 1.5
-            tp2 = price + atr * 2.5
-            tp3 = price + atr * 4
             msg = (
-                f"\n🚀 <b><u>LONG SIGNAL</u></b> - <b>{symbol}</b>\n"
+                f"\n{emoji} <b><u>{direction} SIGNAL</u></b> - <b>{symbol}</b>\n"
                 f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\nSize: <b>{size}</b>\n"
-                f"🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n📈 Trend: Bullish\n"
-                f"📊 Konfirmasi: ✅✅✅✅\n🎯 Sinyal: <b>KUAT</b> 🔥🔥🔥\n"
+                f"🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n"
+                f"📈 Trend: {trend_text}\n"
+                f"📊 Konfirmasi: ✅✅✅✅\n🎯 Sinyal: <b>KUAT</b> {strength_emoji}\n"
                 f"🔁 Trailing aktif setelah TP1"
             )
             send_telegram(msg)
 
-        elif cond_down:
-            tp1 = price - atr * 1.5
-            tp2 = price - atr * 2.5
-            tp3 = price - atr * 4
-            msg = (
-                f"\n🔻 <b><u>SHORT SIGNAL</u></b> - <b>{symbol}</b>\n"
-                f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\nSize: <b>{size}</b>\n"
-                f"🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n📉 Trend: Bearish\n"
-                f"📊 Konfirmasi: ✅✅✅✅\n🎯 Sinyal: <b>KUAT</b> ❄️❄️❄️\n"
-                f"🔁 Trailing aktif setelah TP1"
-            )
-            send_telegram(msg)
+            active_signals.append({
+                "symbol": symbol,
+                "side": direction,
+                "entry": price,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "notified_tp1": False,
+                "notified_tp2": False
+            })
 
-        # Log ke file jika ada sinyal valid
-        if cond_up or cond_down:
             with open("log_sinyal.txt", "a") as f:
-                f.write(f"{datetime.now()} | {symbol} | {'LONG' if cond_up else 'SHORT'} | {price:.2f} | SL: {sl:.2f} | Size: {size}\n")
+                f.write(f"{datetime.now()} | {symbol} | {direction} | {price:.2f} | SL: {sl:.2f} | Size: {size}\n")
+
+        # === SINYAL EARLY ENTRY ===
+        if early_long or early_short:
+            cooldowns[symbol] = now
+            tp1 = price + atr_4h * 1.2 if early_long else price - atr_4h * 1.2
+            tp2 = price + atr_4h * 2 if early_long else price - atr_4h * 2
+            tp3 = price + atr_4h * 3.5 if early_long else price - atr_4h * 3.5
+            sl = price - atr_4h if early_long else price + atr_4h
+            direction = "EARLY LONG" if early_long else "EARLY SHORT"
+            emoji = "🟡" if early_long else "🔸"
+
+            msg = (
+                f"\n{emoji} <b><u>{direction}</u></b> - <b>{symbol}</b>\n"
+                f"Price: <b>{price:.2f}</b>\nSL: <b>{sl:.2f}</b>\n"
+                f"🎯 TP1: {tp1:.2f} | TP2: {tp2:.2f} | TP3: {tp3:.2f}\n"
+                f"⏳ <i>Entry awal - Konfirmasi belum penuh</i>"
+            )
+            send_telegram(msg)
 
     except Exception as e:
         print(f"[ERROR] Saat cek sinyal {symbol}: {str(e)}")
+
+		
+def monitor_active_signals():
+    try:
+        for signal in active_signals:
+            symbol = signal['symbol']
+            klines = client.futures_klines(symbol=symbol, interval='1m', limit=2)
+            last_price = float(klines[-1][4])  # Close price dari candle terakhir
+
+            # LONG
+            if signal['side'] == 'LONG':
+                if not signal['notified_tp1'] and last_price >= signal['tp1']:
+                    send_telegram(f"✅ <b>{symbol} - TP1 TERCAPAI</b>\nHarga: {last_price:.2f}")
+                    signal['notified_tp1'] = True
+                if not signal['notified_tp2'] and last_price >= signal['tp2']:
+                    send_telegram(f"🎯 <b>{symbol} - TP2 TERCAPAI</b>\nHarga: {last_price:.2f}")
+                    signal['notified_tp2'] = True
+
+            # SHORT
+            elif signal['side'] == 'SHORT':
+                if not signal['notified_tp1'] and last_price <= signal['tp1']:
+                    send_telegram(f"✅ <b>{symbol} - TP1 TERCAPAI</b>\nHarga: {last_price:.2f}")
+                    signal['notified_tp1'] = True
+                if not signal['notified_tp2'] and last_price <= signal['tp2']:
+                    send_telegram(f"🎯 <b>{symbol} - TP2 TERCAPAI</b>\nHarga: {last_price:.2f}")
+                    signal['notified_tp2'] = True
+
+    except Exception as e:
+        print(f"[ERROR] Saat monitor TP: {str(e)}")
+
 
 # Loop utama
 while True:
@@ -185,7 +250,12 @@ while True:
         for sym in sampled:
             check_signal(sym)
             time.sleep(0.5)
+
+        monitor_active_signals()  # Panggil monitor TP di dalam try-block
+
         time.sleep(60)
+
     except Exception as err:
         print(f"Main loop error: {err}")
         time.sleep(60)
+
