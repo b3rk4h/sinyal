@@ -12,17 +12,17 @@ from ta.volatility import BollingerBands, AverageTrueRange
 
 # ========= CONFIG =========
 load_dotenv()
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("API_KEY", "")         # isi di .env atau environment
+API_SECRET = os.getenv("API_SECRET", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 MODAL_TOTAL = 20
 LEVERAGE = 20
 
 # Feature toggles
-USE_MTF = True                # require 4H trend confirmation
-USE_ADX_VOLUME = True         # require ADX + volume confirmation
+USE_MTF = True                # require 4H trend confirmation (simple check)
+USE_ADX_VOLUME = True         # require ADX + volume confirmation (simple check)
 USE_ATR_SL_TP = True          # use ATR-based SL/TP
 USE_RSI_DIVERGENCE = False    # optional more strict filter (RSI divergence)
 USE_VOL_CONTRACTION = False   # optional squeeze filter
@@ -116,7 +116,7 @@ def enrich_indicators(df):
         df['trend_up'] = df['ma_fast'] > df['ma_slow']
         df['breakout_up'] = df['close'] > df['bb_upper']
         df['breakout_down'] = df['close'] < df['bb_lower']
-        df['strong_adx'] = df['adx'] > 25
+        df['strong_adx'] = df['adx'] > ADX_4H_MIN
         df['volatility_ok'] = df['atr'] > df['atr'].rolling(20).mean()
     except Exception as e:
         # indicator calc errors ignored (df may miss some cols)
@@ -240,6 +240,7 @@ def check_signal(symbol):
 
         # ADX + volume filter
         if USE_ADX_VOLUME and (cond_up or cond_down):
+            # simple check: require ADX >= threshold on 4h OR volume spike on 4h
             vol4h_avg = d4h['volume'].rolling(20).mean().iloc[-1]
             vol4h_spike = d4h['volume'].iloc[-1] > vol4h_avg * VOL4H_MULT if not pd.isna(vol4h_avg) else False
             if adx_4h < ADX_4H_MIN and d1.iloc[-1].get('adx', 0) < ADX_4H_MIN:
@@ -396,13 +397,70 @@ def monitor_active_signals():
     except Exception as e:
         print("monitor error:", e)
 
+# ========= GET ALL FUTURES USDT SYMBOLS =========
+def get_all_usdt_futures_symbols():
+    try:
+        info = client.futures_exchange_info()
+        return [s['symbol'] for s in info['symbols'] if s['quoteAsset'] == 'USDT' and s['contractType'] == 'PERPETUAL' and s.get('status') == 'TRADING']
+    except Exception as e:
+        print("Error fetching futures symbols:", e)
+        # fallback minimal set
+        return []
+
+# ========= FILTER SYMBOLS =========
+def filter_symbols(symbols):
+    filtered = []
+    for symbol in symbols:
+        try:
+            # simple MTF check: require we can fetch 4h and have enough rows, AND trending info exists
+            if USE_MTF:
+                d4h = get_cached_tf(symbol, '4h')
+                if not isinstance(d4h, pd.DataFrame) or len(d4h) < 30:
+                    continue
+                # permissive: allow both trend_up True/False (we'll validate inside check_signal)
+                # Here we just ensure 4h data exists
+            # simple ADX+Volume check on 4H
+            if USE_ADX_VOLUME:
+                d4h = get_cached_tf(symbol, '4h')
+                if not isinstance(d4h, pd.DataFrame) or len(d4h) < 30:
+                    continue
+                adx_val = float(d4h.iloc[-1].get('adx', 0) or 0)
+                vol_avg = d4h['volume'].rolling(20).mean().iloc[-1]
+                vol_ok = d4h['volume'].iloc[-1] > vol_avg * VOL4H_MULT if not pd.isna(vol_avg) else False
+                # permissive: pass if ADX >= threshold OR volume spike on 4H
+                if adx_val < ADX_4H_MIN and not vol_ok:
+                    # still allow through occasionally (to avoid dropping too many); you can tighten this later
+                    # continue
+                    pass
+            filtered.append(symbol)
+        except Exception as e:
+            print(f"Error filtering {symbol}: {e}")
+    return filtered
+
 # ========= MAIN LOOP =========
 if __name__ == "__main__":
     last_flush = time.time()
+    try:
+        print("Mengambil daftar simbol USDT Futures dari Binance...")
+        all_symbols = get_all_usdt_futures_symbols()
+        print(f"Dapat {len(all_symbols)} simbol.")
+        symbols = filter_symbols(all_symbols)
+        print(f"Sisa {len(symbols)} simbol setelah filter. (scan limit per loop={SCAN_LIMIT})")
+    except Exception as e:
+        print("Init fetch symbols error:", e)
+        symbols = []
+
     while True:
         try:
             client.futures_ping()
-            symbols = filter_symbols(get_all_usdt_futures_symbols())
+            # refresh symbol list occasionally (every loop here you can decide to refresh less often)
+            if not symbols:
+                try:
+                    all_symbols = get_all_usdt_futures_symbols()
+                    symbols = filter_symbols(all_symbols)
+                except Exception:
+                    pass
+
             for sym in symbols[:SCAN_LIMIT]:
                 check_signal(sym)
                 time.sleep(0.15)  # small pause to reduce rate pressure
