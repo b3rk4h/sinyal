@@ -30,8 +30,8 @@ from ta.momentum import RSIIndicator, StochRSIIndicator
 
 # ===================== ENV & SETUP =====================
 load_dotenv()
-API_KEY = os.getenv("BINANCE_API_KEY", "")
-API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+API_KEY = os.getenv("API_KEY", "")
+API_SECRET = os.getenv("API_SECRET", "")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -339,3 +339,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
