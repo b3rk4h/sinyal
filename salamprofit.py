@@ -112,10 +112,8 @@ def binance_client():
 
 def get_klines_df(client, symbol, interval, limit):
     """Fetch closed candles for given symbol/timeframe from Binance Futures."""
-    kl = client.get_klines(
-        symbol=symbol, interval=interval, limit=limit,
-        klines_type=HistoricalKlinesType.FUTURES
-    )
+    # Use the dedicated futures endpoint to avoid extra params errors (-1104)
+    kl = client.futures_klines(symbol=symbol, interval=interval, limit=limit)
     cols = ["t","o","h","l","c","v","ct","qv","ntr","tbbav","tbqv","ig"]
     df = pd.DataFrame(kl, columns=cols)
     for col in ["o","h","l","c","v"]:
@@ -339,4 +337,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
