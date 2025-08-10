@@ -1,182 +1,341 @@
-import ccxt
-import pandas as pd
-import ta
+# bot_sinyal_retrace_v2.py
+# Anti-FOMO retrace signal bot (Binance Futures + Telegram)
+# Features:
+# - Trend filter on 1H (EMA50/EMA200)
+# - Entry on 15m retrace: EMA20 touch + EMA50 hold + RSI/StochRSI confirmation
+# - Entry BAND using EMA20 + Fibonacci(0.5/0.618); pending limit (midpoint) optional
+# - Validity window + slip tolerance (late entries still safe)
+# - Dynamic SL/TP (percent-based) suitable for high leverage (e.g., 75x)
+# - Optional: Only LONG in uptrend, or include SHORT in downtrend
+# - Optional: Set leverage and margin type (ISOLATED) via API
+# - Re-alert on retest after expiry
+#
+# Dependencies:
+#   pip install python-binance pandas numpy ta python-dotenv requests
+#
+# DISCLAIMER: This script sends SIGNALS only. Trading is risky; use at your own discretion.
+
+import os
 import time
+import math
 import requests
-from datetime import datetime
+import numpy as np
+import pandas as pd
+from datetime import datetime, timezone
+from dotenv import load_dotenv
+from binance.client import Client
+from binance.enums import HistoricalKlinesType
+from ta.trend import EMAIndicator
+from ta.momentum import RSIIndicator, StochRSIIndicator
 
-# === Telegram Config ===
-TELEGRAM_TOKEN = '8074521734:AAHIJRTB9Md96h1b690T2iRRzytMwJACxkc'
-CHAT_ID = '1950841966'
+# ===================== ENV & SETUP =====================
+load_dotenv()
+API_KEY = os.getenv("BINANCE_API_KEY", "")
+API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
-def send_telegram(text):
-    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
-    data = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'HTML'}
+if not API_KEY or not API_SECRET:
+    print("[WARN] Missing BINANCE API keys in .env")
+if not TG_TOKEN or not TG_CHAT:
+    print("[WARN] Telegram not configured; messages will print to console only.")
+
+# ===================== CONFIG =====================
+PAIRS = [
+    "LTCUSDT","BTCUSDT","ETHUSDT","LINKUSDT","ETCUSDT",
+    "SUIUSDT","IOTAUSDT","BCHUSDT","XLMUSDT","DASHUSDT","BLURUSDT"
+]
+
+# Timeframes
+TF_TREND = "1h"    # trend filter timeframe
+TF_ENTRY = "15m"   # entry timing timeframe
+
+SCAN_EVERY_SEC = 30            # loop pacing
+CANDLES_FETCH_TREND = 300
+CANDLES_FETCH_ENTRY = 400
+
+# Modes
+CONFIRM_ON_CLOSE = True        # True: signal after 15m candle CLOSE; False: early ping (more risk)
+SIDE_LONG_ONLY = False          # True: LONG only (with uptrend); False: also SHORT in downtrend
+
+# Trend (1H)
+EMA_FAST_TREND = 50
+EMA_SLOW_TREND = 200
+
+# Entry (15m)
+EMA_TOUCH = 20                 # must touch/near EMA20
+EMA_CONFIRM = 50               # must hold above/below EMA50
+RSI_MIN_LONG, RSI_MAX_LONG = 45, 60
+RSI_MIN_SHORT, RSI_MAX_SHORT = 40, 55
+STOCHK_LOW_LONG, STOCHK_HIGH_LONG = 0.25, 0.65
+STOCHK_LOW_SHORT, STOCHK_HIGH_SHORT = 0.35, 0.75
+
+# Entry Band + Tolerances
+USE_FIB = True
+FIB_LOOKBACK = 20              # bars to compute swing high/low
+FIB_LEVELS = (0.5, 0.618)
+ENTRY_WINDOW_MIN = 30          # signal validity window
+SLIP_TOL_PCT = 0.0025          # 0.25% ok-to-chase outside band
+PENDING_LIMIT = True           # suggest midpoint limit
+LIMIT_BUFFER_PCT = 0.0008      # +/- buffer around band for limit
+
+# SL/TP (suited for high leverage)
+SL_PCT  = 0.006   # 0.6%
+TP1_PCT = 0.012   # 1.2%
+TP2_PCT = 0.020   # 2.0%
+
+# Account controls (optional)
+SET_ISOLATED = True            # set isolated margin type
+SET_LEVERAGE = 75              # set leverage per symbol (use with caution; must be supported by symbol)
+LEVERAGE_ON_STARTUP = True     # apply on bot start
+
+# Re-alert control
+REALERT_COOLDOWN_MIN = 20      # after sending a signal, avoid spamming within N minutes
+# ==================================================
+
+def tg(msg: str):
+    """Send Telegram message (fallback to print)."""
+    if not TG_TOKEN or not TG_CHAT:
+        print("[TG]", msg)
+        return
     try:
-        requests.post(url, data=data)
+        requests.get(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            params={"chat_id": TG_CHAT, "text": msg, "parse_mode": "HTML"},
+            timeout=10
+        )
     except Exception as e:
-        print(f"Telegram error: {e}")
+        print("TG error:", e, "\n", msg)
 
-# === Exchange & Market Config ===
-exchange = ccxt.binance({'enableRateLimit': True})
-symbols = ['SOL/USDT', 'SUI/USDT', 'BTC/USDT', 'ETH/USDT', 'OP/USDT', 'WIF/USDT', 'DOGE/USDT']
-timeframe = '15m'
-limit = 120
-last_signal = {}
-last_preview = {}
-hit_tp = {}
+def binance_client():
+    return Client(API_KEY, API_SECRET)
 
-# === Modal & Risk Management ===
-TOTAL_CAPITAL = 20
-RISK_PER_TRADE = 0.05
+def get_klines_df(client, symbol, interval, limit):
+    """Fetch closed candles for given symbol/timeframe from Binance Futures."""
+    kl = client.get_klines(
+        symbol=symbol, interval=interval, limit=limit,
+        klines_type=HistoricalKlinesType.FUTURES
+    )
+    cols = ["t","o","h","l","c","v","ct","qv","ntr","tbbav","tbqv","ig"]
+    df = pd.DataFrame(kl, columns=cols)
+    for col in ["o","h","l","c","v"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
+    return df[["t","o","h","l","c","v"]]
 
-def calculate_targets(price, signal, atr):
-    if signal == 'BUY':
-        tp1 = price * 1.003
-        tp2 = price * 1.006
-        tp3 = price * 1.009
-        sl = price - atr * 1.2
-    else:  # SELL
-        tp1 = price * 0.997
-        tp2 = price * 0.994
-        tp3 = price * 0.991
-        sl = price + atr * 1.2
+def add_indicators(df, ema_fast=20, ema_slow=50):
+    df = df.copy()
+    df["ema_fast"] = EMAIndicator(close=df["c"], window=ema_fast).ema_indicator()
+    df["ema_slow"] = EMAIndicator(close=df["c"], window=ema_slow).ema_indicator()
+    df["rsi"] = RSIIndicator(close=df["c"], window=14).rsi()
+    st = StochRSIIndicator(close=df["c"], window=14, smooth1=3, smooth2=3)
+    df["stoch_k"] = st.stochrsi_k() / 100.0  # 0..1
+    return df
 
-    risk_amount = TOTAL_CAPITAL * RISK_PER_TRADE
-    position_size = risk_amount / abs(price - sl)
+def ema_uptrend(df_1h):
+    ema_fast = EMAIndicator(close=df_1h["c"], window=EMA_FAST_TREND).ema_indicator()
+    ema_slow = EMAIndicator(close=df_1h["c"], window=EMA_SLOW_TREND).ema_indicator()
+    return float(ema_fast.iloc[-1]) > float(ema_slow.iloc[-1])
 
-    tp1_amt = position_size * abs(tp1 - price)
-    tp2_amt = position_size * abs(tp2 - price)
-    tp3_amt = position_size * abs(tp3 - price)
+def ema_downtrend(df_1h):
+    ema_fast = EMAIndicator(close=df_1h["c"], window=EMA_FAST_TREND).ema_indicator()
+    ema_slow = EMAIndicator(close=df_1h["c"], window=EMA_SLOW_TREND).ema_indicator()
+    return float(ema_fast.iloc[-1]) < float(ema_slow.iloc[-1])
 
-    return (round(tp1, 4), round(tp2, 4), round(tp3, 4), round(sl, 4), round(position_size, 2),
-            [round(tp1_amt, 2), round(tp2_amt, 2), round(tp3_amt, 2)])
+def last_candle(df):
+    c = df.iloc[-1]
+    return float(c["o"]), float(c["h"]), float(c["l"]), float(c["c"])
 
-def analyze(df):
-    df['ma5'] = df['close'].rolling(5).mean()
-    df['ma20'] = df['close'].rolling(20).mean()
-    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-    df['atr'] = ta.volatility.AverageTrueRange(df['high'], df['low'], df['close'], window=14).average_true_range()
-    macd = ta.trend.MACD(df['close'])
-    df['macd'] = macd.macd()
-    df['macd_signal'] = macd.macd_signal()
-    df['volume_ma'] = df['volume'].rolling(10).mean()
-    df['adx'] = ta.trend.ADXIndicator(df['high'], df['low'], df['close'], window=14).adx()
+def fmt(n):
+    return f"{n:.6f}".rstrip("0").rstrip(".")
 
-    latest = df.iloc[-1]
-    prev = df.iloc[-2]
+def build_sl_tp(side, price):
+    if side == "LONG":
+        sl  = price * (1 - SL_PCT)
+        tp1 = price * (1 + TP1_PCT)
+        tp2 = price * (1 + TP2_PCT)
+    else:
+        sl  = price * (1 + SL_PCT)
+        tp1 = price * (1 - TP1_PCT)
+        tp2 = price * (1 - TP2_PCT)
+    return sl, tp1, tp2
 
-    signal = None
-    reason = []
+def compute_fib_band(df15, ema20_val):
+    """Compute an entry band using EMA20 and Fibo 0.5/0.618 of recent swing (lookback FIB_LOOKBACK)."""
+    if not USE_FIB:
+        return ema20_val * (1 - LIMIT_BUFFER_PCT), ema20_val * (1 + LIMIT_BUFFER_PCT)
 
-    price = latest['close']
-    atr = latest['atr']
-    atr_ratio = atr / price
+    hh = df15["h"].iloc[-FIB_LOOKBACK-1:-1].max()
+    ll = df15["l"].iloc[-FIB_LOOKBACK-1:-1].min()
+    fib50  = ll + (hh - ll) * FIB_LEVELS[0]
+    fib618 = ll + (hh - ll) * FIB_LEVELS[1]
 
-    if atr_ratio < 0.002:
-        return None, ["❌ Volatilitas terlalu rendah (<0.2%)"], atr
-    elif atr_ratio > 0.015:
-        return None, ["❌ Volatilitas terlalu tinggi (>1.5%)"], atr
+    # Use medians to avoid extremes; create a tight band around EMA20 & fibs
+    low  = np.median([ema20_val*0.999, fib50, fib618]) * (1 - LIMIT_BUFFER_PCT)
+    high = np.median([ema20_val*1.001, fib50, fib618]) * (1 + LIMIT_BUFFER_PCT)
+    if low > high:  # safety
+        low, high = high, low
+    return float(low), float(high)
 
-    # BUY signal
-    if (latest['ma5'] > latest['ma20'] and
-        latest['macd'] > latest['macd_signal'] and
-        latest['rsi'] < 70 and
-        latest['adx'] > 20 and
-        latest['close'] > prev['close'] and
-        latest['volume'] > 1.2 * latest['volume_ma']):
-        signal = 'BUY'
-        reason += ["MA5 > MA20", "MACD bullish", "ADX > 20 (Trend kuat)", "Candle naik + volume"]
+def apply_account_settings_once(client):
+    """Optionally set ISOLATED margin & leverage on startup for all PAIRS."""
+    if not LEVERAGE_ON_STARTUP:
+        return
+    for sym in PAIRS:
+        try:
+            if SET_ISOLATED:
+                #  ISOLATED or CROSSED
+                client.futures_change_margin_type(symbol=sym, marginType="ISOLATED")
+            if SET_LEVERAGE:
+                client.futures_change_leverage(symbol=sym, leverage=SET_LEVERAGE)
+            print(f"[ACC] {sym}: ISOLATED={SET_ISOLATED} LEV={SET_LEVERAGE}")
+        except Exception as e:
+            print(f"[ACC] Skip {sym}: {e}")
 
-    # SELL signal
-    elif (latest['ma5'] < latest['ma20'] and
-          latest['macd'] < latest['macd_signal'] and
-          latest['rsi'] > 30 and
-          latest['adx'] > 20 and
-          latest['close'] < prev['close'] and
-          latest['volume'] > 1.2 * latest['volume_ma']):
-        signal = 'SELL'
-        reason += ["MA5 < MA20", "MACD bearish", "ADX > 20 (Trend kuat)", "Candle turun + volume"]
+# Memory for anti-spam & retest
+last_signal_time = {}     # {symbol: timestamp}
+last_band = {}            # {symbol: (low, high, expiry_ts)}
+last_side = {}            # {symbol: "LONG"/"SHORT"}
 
-    return signal, reason, atr
+def should_realert(sym):
+    """Check cooldown to avoid spamming signals."""
+    now = time.time()
+    ts = last_signal_time.get(sym, 0)
+    return (now - ts) > (REALERT_COOLDOWN_MIN * 60)
 
-print("\n✅ Bot sinyal trading dimulai dengan early signal, TP 0.3–0.9%, ADX + ATR filter aktif...")
-while True:
-    try:
-        for symbol in symbols:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
-            df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+def mark_signal(sym, band_low, band_high, expiry_ts, side):
+    last_signal_time[sym] = time.time()
+    last_band[sym] = (band_low, band_high, expiry_ts)
+    last_side[sym] = side
 
-            signal, reason, atr = analyze(df)
-            now = datetime.utcnow().strftime('%Y-%m-%d %H:%M')
-            price = df['close'].iloc[-1]
+def maybe_realert(sym, current_price):
+    """If band expired, re-alert when price revisits band after cooldown."""
+    if sym not in last_band:
+        return False
+    band_low, band_high, expiry_ts = last_band[sym]
+    now = time.time()
+    if now <= expiry_ts:
+        return False  # still valid; no need
+    if not should_realert(sym):
+        return False
+    if band_low <= current_price <= band_high:
+        return True
+    return False
 
-            if signal:
-                tp1, tp2, tp3, sl, position_size, [amt1, amt2, amt3] = calculate_targets(price, signal, atr)
-                color_tag = '🟢 BUY SIGNAL' if signal == 'BUY' else '🔴 SELL SIGNAL'
+def signal_text(sym, side, entry_low, entry_high, price_ref, rsi, k):
+    now_utc = datetime.utcnow()
+    expiry = now_utc + pd.Timedelta(minutes=ENTRY_WINDOW_MIN)
+    sl, tp1, tp2 = build_sl_tp(side, price_ref)
+    mode = "Confirm on close" if CONFIRM_ON_CLOSE else "Early ping"
+    return (
+        f"{'🟢' if side=='LONG' else '🔴'} <b>RETRACE {side}</b> {sym}\n"
+        f"Entry band: {fmt(entry_low)} – {fmt(entry_high)} "
+        f"(valid s/d {expiry.strftime('%H:%M UTC')})\n"
+        f"Slip OK ≤ {SLIP_TOL_PCT*100:.2f}% di luar band\n"
+        f"RSI {rsi:.1f} | StochK {k:.2f}\n"
+        f"SL {fmt(sl)} | TP1 {fmt(tp1)} | TP2 {fmt(tp2)}\n"
+        f"Mode: {mode}\n"
+        f"Tips: hitung SL/TP dari <i>harga fill</i> kamu."
+    ), (time.time() + ENTRY_WINDOW_MIN * 60)
 
-                if last_signal.get(symbol) != signal:
-                    message = (
-                        f"<b>{color_tag}</b>\n"
-                        f"📊 Pair: <b>{symbol}</b>\n"
-                        f"💰 Harga: <b>{price:.4f}</b>\n"
-                        f"📏 Posisi: <b>{position_size} USDT</b>\n"
-                        f"🕒 Waktu: <b>{now} WIB</b>\n"
-                        f"📋 Alasan: {', '.join(reason)}\n\n"
-                        f"🎯 Target:\n"
-                        f"• TP1: {tp1} (+${amt1})\n"
-                        f"• TP2: {tp2} (+${amt2})\n"
-                        f"• TP3: {tp3} (+${amt3})\n"
-                        f"• SL : {sl} (−${TOTAL_CAPITAL * RISK_PER_TRADE})\n\n"
-                        f"✅ Entry disarankan sekarang.\n📌 Gunakan trailing SL untuk amankan profit."
-                    )
-                    send_telegram(message)
-                    last_signal[symbol] = signal
-                    hit_tp[symbol] = {'tp1': False, 'tp2': False, 'tp3': False}
-                    last_preview[symbol] = None
+def check_symbol(client, sym):
+    # 1) Trend filter (1H)
+    df1h = get_klines_df(client, sym, TF_TREND, CANDLES_FETCH_TREND)
+    up = ema_uptrend(df1h)
+    down = ema_downtrend(df1h)
 
-                elif last_preview.get(symbol) != signal:
-                    preview_tag = '🟢 Early BUY Preview' if signal == 'BUY' else '🔴 Early SELL Preview'
-                    preview_msg = (
-                        f"<b>{preview_tag}</b>\n"
-                        f"📊 Pair: {symbol}\n"
-                        f"💰 Harga saat ini: {price:.4f}\n"
-                        f"📋 Potensi sinyal: {', '.join(reason)}\n"
-                        f"⏳ Menunggu candle berikut..."
-                    )
-                    send_telegram(preview_msg)
-                    last_preview[symbol] = signal
+    if SIDE_LONG_ONLY:
+        if not up:
+            return
+    else:
+        if not (up or down):
+            return
 
-            # === TP Monitor ===
-            if symbol in last_signal:
-                signal = last_signal[symbol]
-                tp1, tp2, tp3, sl, _, _ = calculate_targets(price, signal, atr)
+    # 2) Entry timing (15m)
+    df15 = get_klines_df(client, sym, TF_ENTRY, CANDLES_FETCH_ENTRY)
+    df15 = add_indicators(df15, ema_fast=EMA_TOUCH, ema_slow=EMA_CONFIRM)
+    o,h,l,c = last_candle(df15)
 
-                if signal == 'BUY':
-                    if not hit_tp[symbol]['tp1'] and price >= tp1:
-                        send_telegram(f"✅ <b>TP1 HIT</b> di {symbol} — pertimbangkan naikkan SL!")
-                        hit_tp[symbol]['tp1'] = True
-                    if not hit_tp[symbol]['tp2'] and price >= tp2:
-                        send_telegram(f"✅ <b>TP2 HIT</b> di {symbol} — SL bisa di atas TP1.")
-                        hit_tp[symbol]['tp2'] = True
-                    if not hit_tp[symbol]['tp3'] and price >= tp3:
-                        send_telegram(f"✅ <b>TP3 HIT</b> di {symbol} — take full profit disarankan.")
-                        hit_tp[symbol]['tp3'] = True
+    ema_t = float(df15["ema_fast"].iloc[-1])
+    ema_c = float(df15["ema_slow"].iloc[-1])
+    rsi = float(df15["rsi"].iloc[-1])
+    k = float(df15["stoch_k"].iloc[-1])
 
-                elif signal == 'SELL':
-                    if not hit_tp[symbol]['tp1'] and price <= tp1:
-                        send_telegram(f"✅ <b>TP1 HIT</b> di {symbol} — pertimbangkan turunkan SL!")
-                        hit_tp[symbol]['tp1'] = True
-                    if not hit_tp[symbol]['tp2'] and price <= tp2:
-                        send_telegram(f"✅ <b>TP2 HIT</b> di {symbol} — SL bisa di bawah TP1.")
-                        hit_tp[symbol]['tp2'] = True
-                    if not hit_tp[symbol]['tp3'] and price <= tp3:
-                        send_telegram(f"✅ <b>TP3 HIT</b> di {symbol} — take full profit disarankan.")
-                        hit_tp[symbol]['tp3'] = True
+    # Compute entry band
+    band_low, band_high = compute_fib_band(df15, ema_t)
+    price_ref = c if CONFIRM_ON_CLOSE else o
 
-        time.sleep(60)
+    # Conditions
+    if up:
+        # Need touch EMA20 & hold above EMA50
+        touched = (l <= ema_t <= h) or (abs(c-ema_t)/ema_t < 0.0015)
+        above50 = c > ema_c
+        ok_rsi = (RSI_MIN_LONG <= rsi <= RSI_MAX_LONG)
+        ok_k = (STOCHK_LOW_LONG <= k <= STOCHK_HIGH_LONG)
 
-    except Exception as e:
-        print(f"❌ Error: {e}")
-        time.sleep(60)
+        if touched and above50 and ok_rsi and ok_k:
+            # Late entry tolerance
+            slip_ok = (price_ref <= band_high*(1+SLIP_TOL_PCT))
+            if (band_low <= price_ref <= band_high) or slip_ok:
+                txt, expiry_ts = signal_text(sym, "LONG", band_low, band_high, price_ref, rsi, k)
+                if should_realert(sym):
+                    tg(txt)
+                    print(txt)
+                    mark_signal(sym, band_low, band_high, expiry_ts, "LONG")
+                return
+            # maybe re-alert on retest after expiry
+            if maybe_realert(sym, price_ref):
+                txt, expiry_ts = signal_text(sym, "LONG", band_low, band_high, price_ref, rsi, k)
+                tg(txt)
+                print(txt)
+                mark_signal(sym, band_low, band_high, expiry_ts, "LONG")
+                return
+
+    if (not SIDE_LONG_ONLY) and down:
+        touched = (l <= ema_t <= h) or (abs(c-ema_t)/ema_t < 0.0015)
+        below50 = c < ema_c
+        ok_rsi = (RSI_MIN_SHORT <= rsi <= RSI_MAX_SHORT)
+        ok_k = (STOCHK_LOW_SHORT <= k <= STOCHK_HIGH_SHORT)
+
+        if touched and below50 and ok_rsi and ok_k:
+            slip_ok = (price_ref >= band_low*(1-SLIP_TOL_PCT))
+            if (band_low <= price_ref <= band_high) or slip_ok:
+                txt, expiry_ts = signal_text(sym, "SHORT", band_low, band_high, price_ref, rsi, k)
+                if should_realert(sym):
+                    tg(txt)
+                    print(txt)
+                    mark_signal(sym, band_low, band_high, expiry_ts, "SHORT")
+                return
+            if maybe_realert(sym, price_ref):
+                txt, expiry_ts = signal_text(sym, "SHORT", band_low, band_high, price_ref, rsi, k)
+                tg(txt)
+                print(txt)
+                mark_signal(sym, band_low, band_high, expiry_ts, "SHORT")
+                return
+
+def main():
+    client = binance_client()
+    print("Bot sinyal retrace anti-FOMO berjalan…")
+    if LEVERAGE_ON_STARTUP:
+        apply_account_settings_once(client)
+
+    while True:
+        loop_start = time.time()
+        try:
+            for sym in PAIRS:
+                try:
+                    check_symbol(client, sym)
+                except Exception as e:
+                    print(f"[{sym}] Error:", e)
+            # pacing
+            dt = time.time() - loop_start
+            time.sleep(max(5, SCAN_EVERY_SEC - dt))
+        except KeyboardInterrupt:
+            print("Stop.")
+            break
+        except Exception as e:
+            print("[LOOP] Error:", e)
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
