@@ -176,19 +176,23 @@ def compute_fib_band(df15, ema20_val):
     return float(low), float(high)
 
 def apply_account_settings_once(client):
-    """Optionally set ISOLATED margin & leverage on startup for all PAIRS."""
     if not LEVERAGE_ON_STARTUP:
         return
     for sym in PAIRS:
         try:
             if SET_ISOLATED:
-                #  ISOLATED or CROSSED
                 client.futures_change_margin_type(symbol=sym, marginType="ISOLATED")
             if SET_LEVERAGE:
                 client.futures_change_leverage(symbol=sym, leverage=SET_LEVERAGE)
             print(f"[ACC] {sym}: ISOLATED={SET_ISOLATED} LEV={SET_LEVERAGE}")
         except Exception as e:
-            print(f"[ACC] Skip {sym}: {e}")
+            msg = str(e)
+            # Binance biasanya kasih code di pesan error
+            if "-4046" in msg or "-4003" in msg:
+                print(f"[ACC] {sym}: sudah sesuai (di-skip).")
+            else:
+                print(f"[ACC] Skip {sym}: {e}")
+
 
 # Memory for anti-spam & retest
 last_signal_time = {}     # {symbol: timestamp}
